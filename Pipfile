@@ -8,6 +8,7 @@ torch = {version = "==2.0.0", file = "https://download.pytorch.org/whl/cu118/tor
 torchvision = {version = "==0.15.1", file = "https://download.pytorch.org/whl/cu118/torchvision-0.15.1%2Bcu118-cp311-cp311-win_amd64.whl"}
 torchaudio = {version = "==2.0.1", file = "https://download.pytorch.org/whl/cu118/torchaudio-2.0.1%2Bcu118-cp311-cp311-win_amd64.whl"}
 tqdm = "*"
+soundfile = {version = "*", sys_platform = "== 'win32'"}
 
 [dev-packages]
 bandit = "*"

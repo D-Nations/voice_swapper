@@ -2,6 +2,7 @@
 
 # Project-specific files
 data/audio/
+data/numpy/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
