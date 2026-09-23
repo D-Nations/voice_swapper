@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+from torchaudio.functional import resample
 from torchaudio.transforms import MelSpectrogram
 from tqdm import tqdm
 
@@ -38,8 +39,10 @@ def preprocess_wav_files(
 
     wav_files = list(input_path.glob("*.wav"))
     for wav_file in tqdm(wav_files, desc="Processing WAV files", unit="file"):
-        waveform, _ = load_audio(wav_file)
+        waveform, file_sample_rate = load_audio(wav_file)
         mono = waveform.mean(dim=0)
+        if file_sample_rate != sample_rate:
+            mono = resample(mono, file_sample_rate, sample_rate)
         mel_spectrogram = mel_transform(mono).numpy()
         np.save(output_path / f"{wav_file.stem}.npy", mel_spectrogram)
 

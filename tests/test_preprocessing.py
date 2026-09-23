@@ -30,3 +30,14 @@ def test_stereo_audio_is_downmixed_to_a_2d_spectrogram(make_wav, tmp_path: Path)
     spectrogram = np.load(output_dir / "clip.npy")
     assert spectrogram.ndim == 2
     assert spectrogram.shape[0] == 128
+
+
+def test_audio_is_resampled_to_the_target_rate(make_wav, tmp_path: Path) -> None:
+    wav = make_wav(sample_rate=48000, seconds=1.0)
+    output_dir = tmp_path / "numpy"
+
+    preprocess_wav_files(wav.parent, output_dir, sample_rate=22050, hop_length=256)
+
+    # One second at 22,050 Hz with a centered STFT gives 1 + 22050 // 256 frames.
+    spectrogram = np.load(output_dir / "clip.npy")
+    assert spectrogram.shape[1] == 1 + 22050 // 256
