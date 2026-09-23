@@ -1,25 +1,24 @@
 import math
-import torch
-from typing import Optional
 
+import torch
+
+from rvc.lib.algorithm.attentions import FFN, MultiHeadAttention
 from rvc.lib.algorithm.commons import sequence_mask
 from rvc.lib.algorithm.modules import WaveNet
 from rvc.lib.algorithm.normalization import LayerNorm
-from rvc.lib.algorithm.attentions import FFN, MultiHeadAttention
 
 
 class Encoder(torch.nn.Module):
-    """
-    Encoder module for the Transformer model.
+    """Transformer encoder with relative position attention.
 
     Args:
-        hidden_channels (int): Number of hidden channels in the encoder.
-        filter_channels (int): Number of filter channels in the feed-forward network.
-        n_heads (int): Number of attention heads.
-        n_layers (int): Number of encoder layers.
-        kernel_size (int, optional): Kernel size of the convolution layers in the feed-forward network. Defaults to 1.
-        p_dropout (float, optional): Dropout probability. Defaults to 0.0.
-        window_size (int, optional): Window size for relative positional encoding. Defaults to 10.
+        hidden_channels: Channels of the residual stream.
+        filter_channels: Channels inside the feed-forward networks.
+        n_heads: Attention heads.
+        n_layers: Encoder layers.
+        kernel_size: Kernel size of the feed-forward convolutions.
+        p_dropout: Dropout probability.
+        window_size: Window for relative position encoding.
     """
 
     def __init__(
@@ -31,9 +30,8 @@ class Encoder(torch.nn.Module):
         kernel_size: int = 1,
         p_dropout: float = 0.0,
         window_size: int = 10,
-    ):
+    ) -> None:
         super().__init__()
-
         self.hidden_channels = hidden_channels
         self.n_layers = n_layers
         self.drop = torch.nn.Dropout(p_dropout)
@@ -41,64 +39,47 @@ class Encoder(torch.nn.Module):
         self.attn_layers = torch.nn.ModuleList(
             [
                 MultiHeadAttention(
-                    hidden_channels,
-                    hidden_channels,
-                    n_heads,
-                    p_dropout=p_dropout,
-                    window_size=window_size,
+                    hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout, window_size=window_size
                 )
                 for _ in range(n_layers)
             ]
         )
-        self.norm_layers_1 = torch.nn.ModuleList(
-            [LayerNorm(hidden_channels) for _ in range(n_layers)]
-        )
+        self.norm_layers_1 = torch.nn.ModuleList([LayerNorm(hidden_channels) for _ in range(n_layers)])
         self.ffn_layers = torch.nn.ModuleList(
             [
-                FFN(
-                    hidden_channels,
-                    hidden_channels,
-                    filter_channels,
-                    kernel_size,
-                    p_dropout=p_dropout,
-                )
+                FFN(hidden_channels, hidden_channels, filter_channels, kernel_size, p_dropout=p_dropout)
                 for _ in range(n_layers)
             ]
         )
-        self.norm_layers_2 = torch.nn.ModuleList(
-            [LayerNorm(hidden_channels) for _ in range(n_layers)]
-        )
+        self.norm_layers_2 = torch.nn.ModuleList([LayerNorm(hidden_channels) for _ in range(n_layers)])
 
-    def forward(self, x, x_mask):
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
-
-        for i in range(self.n_layers):
-            y = self.attn_layers[i](x, x, attn_mask)
-            y = self.drop(y)
-            x = self.norm_layers_1[i](x + y)
-
-            y = self.ffn_layers[i](x, x_mask)
-            y = self.drop(y)
-            x = self.norm_layers_2[i](x + y)
-
+        for attn, norm_1, ffn, norm_2 in zip(
+            self.attn_layers, self.norm_layers_1, self.ffn_layers, self.norm_layers_2, strict=True
+        ):
+            x = norm_1(x + self.drop(attn(x, x, attn_mask)))
+            x = norm_2(x + self.drop(ffn(x, x_mask)))
         return x * x_mask
 
 
 class TextEncoder(torch.nn.Module):
-    """
-    Text Encoder with configurable embedding dimension.
+    """Encode content features and coarse pitch into the prior distribution of the latent audio.
+
+    The name comes from VITS, where the input was text. In RVC it is speaker-neutral content
+    features from an embedder such as ContentVec.
 
     Args:
-        out_channels (int): Output channels of the encoder.
-        hidden_channels (int): Hidden channels of the encoder.
-        filter_channels (int): Filter channels of the encoder.
-        n_heads (int): Number of attention heads.
-        n_layers (int): Number of encoder layers.
-        kernel_size (int): Kernel size of the convolutional layers.
-        p_dropout (float): Dropout probability.
-        embedding_dim (int): Embedding dimension for phone embeddings (v1 = 256, v2 = 768).
-        f0 (bool, optional): Whether to use F0 embedding. Defaults to True.
+        out_channels: Channels of the latent.
+        hidden_channels: Channels inside the encoder.
+        filter_channels: Channels inside the feed-forward networks.
+        n_heads: Attention heads.
+        n_layers: Encoder layers.
+        kernel_size: Kernel size of the feed-forward convolutions.
+        p_dropout: Dropout probability.
+        embedding_dim: Size of the content features (768 for ContentVec).
+        f0: Whether to add a coarse pitch embedding.
     """
 
     def __init__(
@@ -112,50 +93,44 @@ class TextEncoder(torch.nn.Module):
         p_dropout: float,
         embedding_dim: int,
         f0: bool = True,
-    ):
+    ) -> None:
         super().__init__()
         self.hidden_channels = hidden_channels
         self.out_channels = out_channels
         self.emb_phone = torch.nn.Linear(embedding_dim, hidden_channels)
         self.lrelu = torch.nn.LeakyReLU(0.1, inplace=True)
         self.emb_pitch = torch.nn.Embedding(256, hidden_channels) if f0 else None
-
-        self.encoder = Encoder(
-            hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
-        )
+        self.encoder = Encoder(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout)
         self.proj = torch.nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(
-        self, phone: torch.Tensor, pitch: Optional[torch.Tensor], lengths: torch.Tensor
-    ):
+        self, phone: torch.Tensor, pitch: torch.Tensor | None, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.emb_phone(phone)
-        if pitch is not None and self.emb_pitch:
+        if pitch is not None and self.emb_pitch is not None:
             x += self.emb_pitch(pitch)
-
         x *= math.sqrt(self.hidden_channels)
         x = self.lrelu(x)
-        x = x.transpose(1, -1)  # [B, H, T]
+        x = x.transpose(1, -1)  # [batch, hidden, time]
 
         x_mask = sequence_mask(lengths, x.size(2)).unsqueeze(1).to(x.dtype)
         x = self.encoder(x, x_mask)
         stats = self.proj(x) * x_mask
-
         m, logs = torch.split(stats, self.out_channels, dim=1)
         return m, logs, x_mask
 
 
 class PosteriorEncoder(torch.nn.Module):
-    """
-    Posterior Encoder for inferring latent representation.
+    """Encode a linear spectrogram into a sample of the latent audio. Used only in training.
 
     Args:
-        in_channels (int): Number of channels in the input.
-        out_channels (int): Number of channels in the output.
-        hidden_channels (int): Number of hidden channels in the encoder.
-        kernel_size (int): Kernel size of the convolutional layers.
-        dilation_rate (int): Dilation rate of the convolutional layers.
-        n_layers (int): Number of layers in the encoder.
-        gin_channels (int, optional): Number of channels for the global conditioning input. Defaults to 0.
+        in_channels: Spectrogram bins.
+        out_channels: Channels of the latent.
+        hidden_channels: Channels inside the WaveNet.
+        kernel_size: WaveNet kernel size.
+        dilation_rate: WaveNet dilation rate.
+        n_layers: WaveNet layers.
+        gin_channels: Channels of the global conditioning input, or 0 for none.
     """
 
     def __init__(
@@ -167,43 +142,20 @@ class PosteriorEncoder(torch.nn.Module):
         dilation_rate: int,
         n_layers: int,
         gin_channels: int = 0,
-    ):
+    ) -> None:
         super().__init__()
         self.out_channels = out_channels
         self.pre = torch.nn.Conv1d(in_channels, hidden_channels, 1)
-        self.enc = WaveNet(
-            hidden_channels,
-            kernel_size,
-            dilation_rate,
-            n_layers,
-            gin_channels=gin_channels,
-        )
+        self.enc = WaveNet(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels)
         self.proj = torch.nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(
-        self, x: torch.Tensor, x_lengths: torch.Tensor, g: Optional[torch.Tensor] = None
-    ):
+        self, x: torch.Tensor, x_lengths: torch.Tensor, g: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x_mask = sequence_mask(x_lengths, x.size(2)).unsqueeze(1).to(x.dtype)
-
         x = self.pre(x) * x_mask
         x = self.enc(x, x_mask, g=g)
-
         stats = self.proj(x) * x_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
-
-        z = m + torch.randn_like(m) * torch.exp(logs)
-        z *= x_mask
-
+        z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
         return z, m, logs, x_mask
-
-    def remove_weight_norm(self):
-        self.enc.remove_weight_norm()
-
-    def __prepare_scriptable__(self):
-        for hook in self.enc._forward_pre_hooks.values():
-            if (
-                hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
-                and hook.__class__.__name__ == "WeightNorm"
-            ):
-                torch.nn.utils.remove_weight_norm(self.enc)
-        return self

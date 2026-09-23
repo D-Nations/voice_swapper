@@ -1,100 +1,104 @@
-from rvc.runtime import CONFIGS_DIR
-import torch
+"""Typed access to the model and training settings in the <sample rate>.json files."""
+
 import json
-import os
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Self
 
-version_config_paths = [
-    os.path.join("48000.json"),
-    os.path.join("40000.json"),
-    os.path.join("32000.json"),
-    os.path.join("24000.json"),
-]
+from rvc.runtime import CONFIGS_DIR
 
-
-def singleton(cls):
-    instances = {}
-
-    def get_instance(*args, **kwargs):
-        if cls not in instances:
-            instances[cls] = cls(*args, **kwargs)
-        return instances[cls]
-
-    return get_instance
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
-@singleton
-class Config:
-    def __init__(self):
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.gpu_name = (
-            torch.cuda.get_device_name(int(self.device.split(":")[-1]))
-            if self.device.startswith("cuda")
-            else None
+def _from_dict[T: DataclassInstance](cls: type[T], values: dict[str, Any]) -> T:
+    """Build a dataclass from a dict, ignoring keys it doesn't define."""
+    names = {field.name for field in fields(cls)}
+    return cls(**{key: value for key, value in values.items() if key in names})
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    log_interval: int
+    seed: int
+    learning_rate: float
+    betas: tuple[float, float]
+    eps: float
+    lr_decay: float
+    segment_size: int  # Samples of audio per training slice.
+    c_mel: float  # Weight of the mel spectrogram loss.
+    c_kl: float  # Weight of the KL divergence loss.
+
+
+@dataclass(frozen=True)
+class DataConfig:
+    max_wav_value: float
+    sample_rate: int
+    filter_length: int
+    hop_length: int
+    win_length: int
+    n_mel_channels: int
+    mel_fmin: float
+    mel_fmax: float | None
+
+    @property
+    def spec_channels(self) -> int:
+        return self.filter_length // 2 + 1
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    inter_channels: int
+    hidden_channels: int
+    filter_channels: int
+    text_enc_hidden_dim: int
+    n_heads: int
+    n_layers: int
+    kernel_size: int
+    p_dropout: float
+    resblock: str
+    resblock_kernel_sizes: list[int]
+    resblock_dilation_sizes: list[list[int]]
+    upsample_rates: list[int]
+    upsample_initial_channel: int
+    upsample_kernel_sizes: list[int]
+    use_spectral_norm: bool
+    gin_channels: int
+    spk_embed_dim: int
+
+
+@dataclass(frozen=True)
+class RVCConfig:
+    train: TrainConfig
+    data: DataConfig
+    model: ModelConfig
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> Self:
+        train = dict(values["train"], betas=tuple(values["train"]["betas"]))
+        return cls(
+            train=_from_dict(TrainConfig, train),
+            data=_from_dict(DataConfig, values["data"]),
+            model=_from_dict(ModelConfig, values["model"]),
         )
-        self.json_config = self.load_config_json()
-        self.gpu_mem = None
-        self.x_pad, self.x_query, self.x_center, self.x_max = self.device_config()
 
-    def load_config_json(self):
-        configs = {}
-        for config_file in version_config_paths:
-            config_path = str(CONFIGS_DIR / config_file)
-            with open(config_path, "r", encoding="utf-8") as f:
-                configs[config_file] = json.load(f)
-        return configs
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        with open(path, encoding="utf-8") as file:
+            return cls.from_dict(json.load(file))
 
-    def device_config(self):
-        if self.device.startswith("cuda"):
-            self.set_cuda_config()
-        else:
-            self.device = "cpu"
+    @classmethod
+    def for_sample_rate(cls, sample_rate: int) -> Self:
+        return cls.load(config_path(sample_rate))
 
-        # Configuration for 6GB GPU memory
-        x_pad, x_query, x_center, x_max = (1, 6, 38, 41)
-        if self.gpu_mem is not None and self.gpu_mem <= 4:
-            # Configuration for 5GB GPU memory
-            x_pad, x_query, x_center, x_max = (1, 5, 30, 32)
-
-        return x_pad, x_query, x_center, x_max
-
-    def set_cuda_config(self):
-        i_device = int(self.device.split(":")[-1])
-        self.gpu_name = torch.cuda.get_device_name(i_device)
-        self.gpu_mem = torch.cuda.get_device_properties(i_device).total_memory // (
-            1024**3
-        )
+    @property
+    def segment_frames(self) -> int:
+        """Spectrogram frames per training slice."""
+        return self.train.segment_size // self.data.hop_length
 
 
-def max_vram_gpu(gpu):
-    if torch.cuda.is_available():
-        gpu_properties = torch.cuda.get_device_properties(gpu)
-        total_memory_gb = round(gpu_properties.total_memory / 1024 / 1024 / 1024)
-        return total_memory_gb
-    else:
-        return "8"
-
-
-def get_gpu_info():
-    ngpu = torch.cuda.device_count()
-    gpu_infos = []
-    if torch.cuda.is_available() or ngpu != 0:
-        for i in range(ngpu):
-            gpu_name = torch.cuda.get_device_name(i)
-            mem = int(
-                torch.cuda.get_device_properties(i).total_memory / 1024 / 1024 / 1024
-                + 0.4
-            )
-            gpu_infos.append(f"{i}: {gpu_name} ({mem} GB)")
-    if len(gpu_infos) > 0:
-        gpu_info = "\n".join(gpu_infos)
-    else:
-        gpu_info = "Unfortunately, there is no compatible GPU available to support your training."
-    return gpu_info
-
-
-def get_number_of_gpus():
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        return "-".join(map(str, range(num_gpus)))
-    else:
-        return "-"
+def config_path(sample_rate: int) -> Path:
+    path = CONFIGS_DIR / f"{sample_rate}.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"No model config for {sample_rate} Hz.")
+    return path

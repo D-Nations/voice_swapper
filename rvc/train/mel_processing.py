@@ -1,187 +1,57 @@
 import torch
-import torch.utils.data
 from librosa.filters import mel as librosa_mel_fn
+from torch.nn import functional as F
 
-mel_basis = {}
-hann_window = {}
+# Caches keyed by size, dtype, and device, since these are rebuilt on every training step otherwise.
+_mel_basis: dict[str, torch.Tensor] = {}
+_hann_window: dict[str, torch.Tensor] = {}
 
 
-def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
-    """
-    Compute the spectrogram of a signal using STFT.
+def spectrogram_torch(y: torch.Tensor, n_fft: int, hop_size: int, win_size: int, center: bool = False) -> torch.Tensor:
+    """Magnitude spectrogram of [batch, samples] audio, reflect-padded so frames line up with hops."""
+    key = f"{win_size}_{y.dtype}_{y.device}"
+    if key not in _hann_window:
+        _hann_window[key] = torch.hann_window(win_size).to(dtype=y.dtype, device=y.device)
 
-    Args:
-        y (torch.Tensor): Input signal.
-        n_fft (int): FFT window size.
-        hop_size (int): Hop size between frames.
-        win_size (int): Window size.
-        center (bool, optional): Whether to center the window. Defaults to False.
-    """
-    global hann_window
-    dtype_device = str(y.dtype) + "_" + str(y.device)
-    wnsize_dtype_device = str(win_size) + "_" + dtype_device
-    if wnsize_dtype_device not in hann_window:
-        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(
-            dtype=y.dtype, device=y.device
-        )
-
-    y = torch.nn.functional.pad(
-        y.unsqueeze(1),
-        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
-        mode="reflect",
-    )
-    y = y.squeeze(1)
-
+    pad = (n_fft - hop_size) // 2
+    y = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
     spec = torch.stft(
         y,
         n_fft=n_fft,
         hop_length=hop_size,
         win_length=win_size,
-        window=hann_window[wnsize_dtype_device],
+        window=_hann_window[key],
         center=center,
         pad_mode="reflect",
         normalized=False,
         onesided=True,
         return_complex=True,
     )
-
-    spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-6)
-
-    return spec
+    return torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-6)
 
 
-def spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax):
-    """
-    Convert a spectrogram to a mel-spectrogram.
-
-    Args:
-        spec (torch.Tensor): Magnitude spectrogram.
-        n_fft (int): FFT window size.
-        num_mels (int): Number of mel frequency bins.
-        sample_rate (int): Sampling rate of the audio signal.
-        fmin (float): Minimum frequency.
-        fmax (float): Maximum frequency.
-    """
-    global mel_basis
-    dtype_device = str(spec.dtype) + "_" + str(spec.device)
-    fmax_dtype_device = str(fmax) + "_" + dtype_device
-    if fmax_dtype_device not in mel_basis:
-        mel = librosa_mel_fn(
-            sr=sample_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
-        )
-        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(
-            dtype=spec.dtype, device=spec.device
-        )
-
-    melspec = torch.matmul(mel_basis[fmax_dtype_device], spec)
-    melspec = torch.log(melspec.clamp(min=1e-5) * 1)
-    return melspec
+def spec_to_mel_torch(
+    spec: torch.Tensor, n_fft: int, num_mels: int, sample_rate: int, fmin: float, fmax: float | None
+) -> torch.Tensor:
+    """Log mel spectrogram from a magnitude spectrogram."""
+    key = f"{fmax}_{spec.dtype}_{spec.device}"
+    if key not in _mel_basis:
+        mel = librosa_mel_fn(sr=sample_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+        _mel_basis[key] = torch.from_numpy(mel).to(dtype=spec.dtype, device=spec.device)
+    return torch.log(torch.matmul(_mel_basis[key], spec).clamp(min=1e-5))
 
 
 def mel_spectrogram_torch(
-    y, n_fft, num_mels, sample_rate, hop_size, win_size, fmin, fmax, center=False
-):
-    """
-    Compute the mel-spectrogram of a signal.
-
-    Args:
-        y (torch.Tensor): Input signal.
-        n_fft (int): FFT window size.
-        num_mels (int): Number of mel frequency bins.
-        sample_rate (int): Sampling rate of the audio signal.
-        hop_size (int): Hop size between frames.
-        win_size (int): Window size.
-        fmin (float): Minimum frequency.
-        fmax (float): Maximum frequency.
-        center (bool, optional): Whether to center the window. Defaults to False.
-    """
+    y: torch.Tensor,
+    n_fft: int,
+    num_mels: int,
+    sample_rate: int,
+    hop_size: int,
+    win_size: int,
+    fmin: float,
+    fmax: float | None,
+    center: bool = False,
+) -> torch.Tensor:
+    """Log mel spectrogram of [batch, samples] audio."""
     spec = spectrogram_torch(y, n_fft, hop_size, win_size, center)
-
-    melspec = spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax)
-
-    return melspec
-
-
-def compute_window_length(n_mels: int, sample_rate: int):
-    f_min = 0
-    f_max = sample_rate / 2
-    window_length_seconds = 8 * n_mels / (f_max - f_min)
-    window_length = int(window_length_seconds * sample_rate)
-    return 2 ** (window_length.bit_length() - 1)
-
-
-class MultiScaleMelSpectrogramLoss(torch.nn.Module):
-
-    def __init__(
-        self,
-        sample_rate: int = 24000,
-        n_mels: list[int] = [5, 10, 20, 40, 80, 160, 320],  # , 480],
-        window_lengths: list[int] = [32, 64, 128, 256, 512, 1024, 2048],  # , 4096],
-        loss_fn=torch.nn.L1Loss(),
-    ):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.loss_fn = loss_fn
-        self.log_base = torch.log(torch.tensor(10.0))
-        self.stft_params: list[tuple] = []
-        self.hann_window: dict[int, torch.Tensor] = {}
-        self.mel_banks: dict[int, torch.Tensor] = {}
-
-        self.stft_params = [(mel, win) for mel, win in zip(n_mels, window_lengths)]
-
-    def mel_spectrogram(
-        self,
-        wav: torch.Tensor,
-        n_mels: int,
-        window_length: int,
-    ):
-        # IDs for caching
-        dtype_device = str(wav.dtype) + "_" + str(wav.device)
-        win_dtype_device = str(window_length) + "_" + dtype_device
-        mel_dtype_device = str(n_mels) + "_" + dtype_device
-        # caching hann window
-        if win_dtype_device not in self.hann_window:
-            self.hann_window[win_dtype_device] = torch.hann_window(
-                window_length, device=wav.device, dtype=torch.float32
-            )
-
-        wav = wav.squeeze(1)  # -> torch(B, T)
-
-        stft = torch.stft(
-            wav.float(),
-            n_fft=window_length,
-            hop_length=window_length // 4,
-            window=self.hann_window[win_dtype_device],
-            return_complex=True,
-        )  # -> torch (B, window_length // 2 + 1, (T - window_length)/hop_length + 1)
-
-        magnitude = torch.sqrt(stft.real.pow(2) + stft.imag.pow(2) + 1e-6)
-
-        # caching mel filter
-        if mel_dtype_device not in self.mel_banks:
-            self.mel_banks[mel_dtype_device] = torch.from_numpy(
-                librosa_mel_fn(
-                    sr=self.sample_rate,
-                    n_mels=n_mels,
-                    n_fft=window_length,
-                    fmin=0,
-                    fmax=None,
-                )
-            ).to(device=wav.device, dtype=torch.float32)
-
-        mel_spectrogram = torch.matmul(
-            self.mel_banks[mel_dtype_device], magnitude
-        )  # torch(B, n_mels, stft.frames)
-        return mel_spectrogram
-
-    def forward(
-        self, real: torch.Tensor, fake: torch.Tensor
-    ):  # real: torch(B, 1, T) , fake: torch(B, 1, T)
-        loss = 0.0
-        for p in self.stft_params:
-            real_mels = self.mel_spectrogram(real, *p)
-            fake_mels = self.mel_spectrogram(fake, *p)
-            real_logmels = torch.log(real_mels.clamp(min=1e-5)) / self.log_base
-            fake_logmels = torch.log(fake_mels.clamp(min=1e-5)) / self.log_base
-            loss += self.loss_fn(real_logmels, fake_logmels)
-        return loss
+    return spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax)

@@ -1,75 +1,76 @@
+"""Stage 4: build the voice's retrieval index from its training features.
+
+At conversion time, each input frame's content features can be blended with their nearest
+neighbours from the training set, which pulls the output's articulation toward the target voice.
+
+Writes <experiment dir>/<name>.index. Run with: python -m rvc.train.process.extract_index --experiment-dir DIR
+"""
+
+import argparse
 import os
-import sys
-from multiprocessing import cpu_count
+from pathlib import Path
+from typing import Literal
 
 import faiss
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 
-# Parse command line arguments
-exp_dir = str(sys.argv[1])
-index_algorithm = str(sys.argv[2])
+FEATURE_DIM = 768
+MAX_POINTS = 200_000  # Above this many frames, the features are reduced to KMEANS_CLUSTERS centroids.
+KMEANS_CLUSTERS = 10_000
+ADD_BATCH_SIZE = 8192
 
-feature_dir = os.path.join(exp_dir, "extracted")
-model_name = os.path.basename(exp_dir)
+type IndexAlgorithm = Literal["auto", "kmeans"]
 
-if not os.path.exists(feature_dir):
-    print(
-        f"Feature to generate index file not found at {feature_dir}. Did you run preprocessing and feature extraction steps?"
+
+def build_index(experiment_dir: Path, algorithm: IndexAlgorithm = "auto") -> Path:
+    feature_dir = experiment_dir / "extracted"
+    index_path = experiment_dir / f"{experiment_dir.name}.index"
+    if index_path.exists():
+        print(f"{index_path} already exists.")
+        return index_path
+    feature_files = sorted(feature_dir.glob("*.npy")) if feature_dir.is_dir() else []
+    if not feature_files:
+        raise FileNotFoundError(f"No features found in {feature_dir}. Run the extract stage first.")
+
+    print(f"Building the index for {experiment_dir.name}...")
+    features = np.concatenate([np.load(path) for path in feature_files], axis=0)
+    np.random.shuffle(features)
+
+    if features.shape[0] > MAX_POINTS or algorithm == "kmeans":
+        kmeans = MiniBatchKMeans(
+            n_clusters=KMEANS_CLUSTERS,
+            verbose=True,
+            batch_size=256 * (os.cpu_count() or 1),
+            compute_labels=False,
+            init="random",
+        )
+        features = kmeans.fit(features).cluster_centers_
+
+    n_ivf = min(int(16 * np.sqrt(features.shape[0])), features.shape[0] // 39)
+    index = faiss.index_factory(FEATURE_DIM, f"IVF{n_ivf},Flat")
+    faiss.extract_index_ivf(index).nprobe = 1
+    index.train(features)
+    for start in range(0, features.shape[0], ADD_BATCH_SIZE):
+        index.add(features[start : start + ADD_BATCH_SIZE])
+
+    faiss.write_index(index, str(index_path))
+    print(f"Saved {index_path}")
+    return index_path
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--experiment-dir", type=Path, required=True)
+    parser.add_argument(
+        "--algorithm",
+        choices=["auto", "kmeans"],
+        default="auto",
+        help="kmeans always clusters the features first. auto does only for large datasets.",
     )
-    sys.exit(1)
+    args = parser.parse_args(argv)
+    build_index(args.experiment_dir, args.algorithm)
 
-index_filename_added = f"{model_name}.index"
-index_filepath_added = os.path.join(exp_dir, index_filename_added)
 
-if os.path.exists(index_filepath_added):
-    pass
-else:
-    npys = []
-    print(f"Generating index for '{model_name}', this may take a while...")
-    listdir_res = sorted(os.listdir(feature_dir))
-
-    for name in listdir_res:
-        file_path = os.path.join(feature_dir, name)
-        phone = np.load(file_path)
-        npys.append(phone)
-
-    if not npys:
-        print(
-            f"Feature files in {feature_dir} could not be loaded correctly. Did you run preprocessing and feature extraction steps?"
-        )
-        sys.exit(1)
-
-    big_npy = np.concatenate(npys, axis=0)
-
-    big_npy_idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(big_npy_idx)
-    big_npy = big_npy[big_npy_idx]
-
-    if big_npy.shape[0] > 2e5 or index_algorithm == "KMeans":
-        big_npy = (
-            MiniBatchKMeans(
-                n_clusters=10000,
-                verbose=True,
-                batch_size=256 * cpu_count(),
-                compute_labels=False,
-                init="random",
-            )
-            .fit(big_npy)
-            .cluster_centers_
-        )
-
-    n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-
-    # index_added
-    index_added = faiss.index_factory(768, f"IVF{n_ivf},Flat")
-    index_ivf_added = faiss.extract_index_ivf(index_added)
-    index_ivf_added.nprobe = 1
-    index_added.train(big_npy)
-
-    batch_size_add = 8192
-    for i in range(0, big_npy.shape[0], batch_size_add):
-        index_added.add(big_npy[i : i + batch_size_add])
-
-    faiss.write_index(index_added, index_filepath_added)
-    print(f"Saved index file '{index_filepath_added}'")
+if __name__ == "__main__":
+    main()

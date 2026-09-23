@@ -1,100 +1,72 @@
-import os
+import random
 import shutil
-from random import shuffle
-from rvc.configs.config import Config
-from rvc.runtime import CONFIGS_DIR, MUTE_DIR
-import json
+from pathlib import Path
 
-config = Config()
+from rvc.configs.config import config_path
+from rvc.runtime import MUTE_DIR
+from rvc.train.model_info import read_model_info, update_model_info
 
-
-def generate_config(sample_rate: int, model_path: str):
-    config_path = str(CONFIGS_DIR / f"{sample_rate}.json")
-    config_save_path = os.path.join(model_path, "config.json")
-    if not os.path.exists(config_save_path):
-        shutil.copyfile(config_path, config_save_path)
+# Only the ContentVec mute set is bundled. Applio also shipped sets for its other embedders.
+SUPPORTED_EMBEDDER = "contentvec"
 
 
-def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2):
-    gt_wavs_dir = os.path.join(model_path, "sliced_audios")
-    feature_dir = os.path.join(model_path, f"extracted")
+def generate_config(sample_rate: int, experiment_dir: Path) -> None:
+    """Copy the model config for sample_rate into the experiment, unless it already has one."""
+    destination = experiment_dir / "config.json"
+    if not destination.exists():
+        shutil.copyfile(config_path(sample_rate), destination)
 
-    f0_dir, f0nsf_dir = None, None
-    f0_dir = os.path.join(model_path, "f0")
-    f0nsf_dir = os.path.join(model_path, "f0_voiced")
 
-    gt_wavs_files = set(name.split(".")[0] for name in os.listdir(gt_wavs_dir))
-    feature_files = set(name.split(".")[0] for name in os.listdir(feature_dir))
+def _stems(folder: Path) -> set[str]:
+    return {path.name.split(".")[0] for path in folder.iterdir()}
 
-    f0_files = set(name.split(".")[0] for name in os.listdir(f0_dir))
-    f0nsf_files = set(name.split(".")[0] for name in os.listdir(f0nsf_dir))
-    names = gt_wavs_files & feature_files & f0_files & f0nsf_files
 
-    try:
-        model_info_path = os.path.join(model_path, "model_info.json")
-        with open(model_info_path, "r", encoding="utf-8") as f:
-            model_info = json.load(f)
-            embedder_name = model_info["embedder_model"]
-    except:
-        embedder_name = "contentvec"
+def _line(*fields: Path | str) -> str:
+    return "|".join(str(field) for field in fields).replace("\\", "/")
 
-    # Only the contentvec mute set is bundled. Applio also shipped sets for the spin embedders.
-    if embedder_name != "contentvec":
-        raise ValueError(f"No mute files bundled for embedder {embedder_name!r}. Use contentvec.")
-    mute_base_path = str(MUTE_DIR)
 
-    options = []
-    sids = []
-    for name in names:
-        sid = name.split("_")[0]
-        if sid not in sids:
-            sids.append(sid)
+def generate_filelist(experiment_dir: Path, sample_rate: int, include_mutes: int = 2) -> None:
+    """Write filelist.txt: one line per slice with all four extracted files, plus silent examples.
 
-        # Absolute paths, so the file list works from any directory and across drives
-        rel_wav = os.path.abspath(f"{os.path.join(gt_wavs_dir, name)}.wav")
-        rel_feat = os.path.abspath(f"{os.path.join(feature_dir, name)}.npy")
-        rel_f0 = os.path.abspath(f"{os.path.join(f0_dir, name)}.wav.npy")
-        rel_f0nsf = os.path.abspath(f"{os.path.join(f0nsf_dir, name)}.wav.npy")
+    Each line is "<wav>|<features>|<coarse pitch>|<pitch in Hz>|<speaker id>", with absolute paths
+    so training works from any directory. include_mutes silent examples per speaker teach the
+    model to stay quiet in pauses.
+    """
+    wav_dir = experiment_dir / "sliced_audios"
+    feature_dir = experiment_dir / "extracted"
+    f0_dir = experiment_dir / "f0"
+    f0nsf_dir = experiment_dir / "f0_voiced"
+    names = _stems(wav_dir) & _stems(feature_dir) & _stems(f0_dir) & _stems(f0nsf_dir)
 
-        options.append(
-            f"{rel_wav}|{rel_feat}|{rel_f0}|{rel_f0nsf}|{sid}".replace("\\", "/")
-        )
+    embedder = read_model_info(experiment_dir).get("embedder_model", SUPPORTED_EMBEDDER)
+    if embedder != SUPPORTED_EMBEDDER:
+        raise ValueError(f"No mute files bundled for embedder {embedder!r}. Use {SUPPORTED_EMBEDDER}.")
 
-    if include_mutes > 0:
-        mute_audio_path = os.path.abspath(
-            os.path.join(mute_base_path, "sliced_audios", f"mute{sample_rate}.wav")
-        )
-        mute_feature_path = os.path.abspath(
-            os.path.join(mute_base_path, f"extracted", "mute.npy")
-        )
-        mute_f0_path = os.path.abspath(
-            os.path.join(mute_base_path, "f0", "mute.wav.npy")
-        )
-        mute_f0nsf_path = os.path.abspath(
-            os.path.join(mute_base_path, "f0_voiced", "mute.wav.npy")
-        )
-
-        # adding x files per sid
-        for sid in sids * include_mutes:
-            options.append(
-                f"{mute_audio_path}|{mute_feature_path}|{mute_f0_path}|{mute_f0nsf_path}|{sid}".replace("\\", "/")
+    lines = []
+    speaker_ids: list[str] = []
+    for name in sorted(names):
+        speaker_id = name.split("_")[0]
+        if speaker_id not in speaker_ids:
+            speaker_ids.append(speaker_id)
+        lines.append(
+            _line(
+                (wav_dir / f"{name}.wav").resolve(),
+                (feature_dir / f"{name}.npy").resolve(),
+                (f0_dir / f"{name}.wav.npy").resolve(),
+                (f0nsf_dir / f"{name}.wav.npy").resolve(),
+                speaker_id,
             )
+        )
 
-    file_path = os.path.join(model_path, "model_info.json")
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = {}
-    data.update(
-        {
-            "speakers_id": len(sids),
-        }
+    mute = (
+        MUTE_DIR / "sliced_audios" / f"mute{sample_rate}.wav",
+        MUTE_DIR / "extracted" / "mute.npy",
+        MUTE_DIR / "f0" / "mute.wav.npy",
+        MUTE_DIR / "f0_voiced" / "mute.wav.npy",
     )
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=4)
+    for speaker_id in speaker_ids * include_mutes:
+        lines.append(_line(*(path.resolve() for path in mute), speaker_id))
 
-    shuffle(options)
-
-    with open(os.path.join(model_path, "filelist.txt"), "w") as f:
-        f.write("\n".join(options))
+    update_model_info(experiment_dir, speakers_id=len(speaker_ids))
+    random.shuffle(lines)
+    (experiment_dir / "filelist.txt").write_text("\n".join(lines), encoding="utf-8")

@@ -1,7 +1,7 @@
 """Train one RVC voice model from a folder of clips.
 
-Runs the four training stages from the rvc package, each as its own process the way Applio does,
-since each stage manages its own worker processes:
+Runs the four training stages from the rvc package, each as its own process, so each stage's
+GPU memory and worker processes are released before the next starts:
 
 1. preprocess  Slice the clips and resample them to the model's sample rate.
 2. extract     Track pitch with RMVPE and extract ContentVec features on the GPU.
@@ -22,26 +22,23 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from rvc.runtime import LOGS_DIR, PACKAGE_DIR
+from rvc.runtime import LOGS_DIR, MODELS_DIR
 from rvc.weights import DEFAULT_SAMPLE_RATE, SAMPLE_RATES, base_model_files, missing_files
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TOTAL_EPOCHS = 300
 SAVE_EVERY_EPOCHS = 10
 BATCH_SIZE = 8  # Fits in 8 GB of GPU memory at 40 kHz.
-GPU = "0"
+DEVICE = "cuda:0"
 CPU_PROCESSES = max(1, min(8, (os.cpu_count() or 2) // 2))
 
-# Preprocessing: automatic slicing into 3-second chunks with 0.3 seconds of overlap, and no extra
-# filtering or noise reduction, since the clips are already clean speech.
-CUT_MODE = "Automatic"
+# Preprocessing cuts clips at silences, then into 3-second chunks with 0.3 seconds of overlap.
 CHUNK_SECONDS = 3.0
 OVERLAP_SECONDS = 0.3
-
-PITCH_METHOD = "rmvpe"
-EMBEDDER = "contentvec"
 MUTE_COPIES = 2  # Silent examples mixed in per speaker, which helps the model stay quiet in pauses.
-VOCODER = "HiFi-GAN"
-INDEX_ALGORITHM = "Auto"
+
+STAGES = ("preprocess", "extract", "train", "index")
 
 
 @dataclass(frozen=True)
@@ -53,7 +50,7 @@ class TrainingRun:
     total_epochs: int = TOTAL_EPOCHS
     save_every_epochs: int = SAVE_EVERY_EPOCHS
     batch_size: int = BATCH_SIZE
-    gpu: str = GPU
+    device: str = DEVICE
     cpu_processes: int = CPU_PROCESSES
 
     @property
@@ -63,65 +60,46 @@ class TrainingRun:
 
 def stage_commands(run: TrainingRun) -> list[tuple[str, list[str]]]:
     """The command line for each training stage, in order."""
-    scripts = PACKAGE_DIR / "train"
     python = sys.executable
-    pretrained_g, pretrained_d = (str(PACKAGE_DIR / "models" / path) for path in base_model_files(run.sample_rate))
+    experiment = str(run.experiment_dir)
+    pretrained_g, pretrained_d = (str(MODELS_DIR / path) for path in base_model_files(run.sample_rate))
     return [
         (
             "preprocess",
             [
-                python,
-                str(scripts / "preprocess" / "preprocess.py"),
-                str(run.experiment_dir),
-                str(run.dataset_dir),
-                str(run.sample_rate),
-                str(run.cpu_processes),
-                CUT_MODE,
-                "False",  # extra filtering effects
-                "False",  # noise reduction
-                "0.7",  # noise reduction strength, unused while noise reduction is off
-                str(CHUNK_SECONDS),
-                str(OVERLAP_SECONDS),
-                "none",  # loudness normalization
+                *(python, "-m", "rvc.train.preprocess.preprocess"),
+                *("--experiment-dir", experiment),
+                *("--dataset", str(run.dataset_dir)),
+                *("--sample-rate", str(run.sample_rate)),
+                *("--processes", str(run.cpu_processes)),
+                *("--chunk-seconds", str(CHUNK_SECONDS)),
+                *("--overlap-seconds", str(OVERLAP_SECONDS)),
             ],
         ),
         (
             "extract",
             [
-                python,
-                str(scripts / "extract" / "extract.py"),
-                str(run.experiment_dir),
-                PITCH_METHOD,
-                str(run.cpu_processes),
-                run.gpu,
-                str(run.sample_rate),
-                EMBEDDER,
-                "None",  # custom embedder path
-                str(MUTE_COPIES),
+                *(python, "-m", "rvc.train.extract.extract"),
+                *("--experiment-dir", experiment),
+                *("--sample-rate", str(run.sample_rate)),
+                *("--device", run.device),
+                *("--mute-copies", str(MUTE_COPIES)),
             ],
         ),
         (
             "train",
             [
-                python,
-                str(scripts / "train.py"),
-                run.name,
-                str(run.save_every_epochs),
-                str(run.total_epochs),
-                pretrained_g,
-                pretrained_d,
-                run.gpu,
-                str(run.batch_size),
-                str(run.sample_rate),
-                "True",  # keep only the latest full checkpoint, which is large, for resuming
-                "True",  # export a small voice model at every save
-                "False",  # cache the dataset in GPU memory
-                "False",  # delete a previous run's files first
-                VOCODER,
-                "False",  # gradient checkpointing, which saves memory at the cost of speed
+                *(python, "-m", "rvc.train.train"),
+                *("--experiment-dir", experiment),
+                *("--pretrained-g", pretrained_g),
+                *("--pretrained-d", pretrained_d),
+                *("--epochs", str(run.total_epochs)),
+                *("--save-every", str(run.save_every_epochs)),
+                *("--batch-size", str(run.batch_size)),
+                *("--device", run.device),
             ],
         ),
-        ("index", [python, str(scripts / "process" / "extract_index.py"), str(run.experiment_dir), INDEX_ALGORITHM]),
+        ("index", [python, "-m", "rvc.train.process.extract_index", "--experiment-dir", experiment]),
     ]
 
 
@@ -140,7 +118,9 @@ def train_voice(run: TrainingRun, stages: list[str] | None = None) -> None:
     """Run the training stages in order, stopping at the first one that fails."""
     check_inputs(run)
     run.experiment_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ | {"RVC_LOGS_DIR": str(run.logs_dir)}
+    # The stages import the rvc package, so it must be importable whatever the working directory.
+    python_path = os.pathsep.join(filter(None, [str(REPO_ROOT), os.environ.get("PYTHONPATH")]))
+    env = os.environ | {"PYTHONPATH": python_path}
     for stage, command in stage_commands(run):
         if stages is not None and stage not in stages:
             continue
@@ -159,12 +139,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--epochs", type=int, default=TOTAL_EPOCHS)
     parser.add_argument("--save-every", type=int, default=SAVE_EVERY_EPOCHS, help="Epochs between saved models")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--gpu", default=GPU)
+    parser.add_argument("--device", default=DEVICE, help="Such as cuda:0 or cpu")
     parser.add_argument(
-        "--stages",
-        nargs="+",
-        choices=["preprocess", "extract", "train", "index"],
-        help="Run only these stages, for example to rebuild the index",
+        "--stages", nargs="+", choices=STAGES, help="Run only these stages, for example to rebuild the index"
     )
     args = parser.parse_args(argv)
 
@@ -176,7 +153,7 @@ def main(argv: list[str] | None = None) -> None:
         total_epochs=args.epochs,
         save_every_epochs=args.save_every,
         batch_size=args.batch_size,
-        gpu=args.gpu,
+        device=args.device,
     )
     train_voice(run, args.stages)
     print(f"Finished. Models and index are in {run.experiment_dir}")

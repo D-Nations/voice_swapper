@@ -1,40 +1,53 @@
+from collections.abc import Sequence
+from typing import Self
+
 import torch
-from typing import Optional
-from rvc.lib.algorithm.generators.hifigan_mrf import HiFiGANMRFGenerator
+
+from rvc.configs.config import ModelConfig
+from rvc.lib.algorithm.commons import rand_slice_segments, remove_weight_norm, slice_segments
+from rvc.lib.algorithm.encoders import PosteriorEncoder, TextEncoder
 from rvc.lib.algorithm.generators.hifigan_nsf import HiFiGANNSFGenerator
-from rvc.lib.algorithm.generators.hifigan import HiFiGANGenerator
-from rvc.lib.algorithm.generators.refinegan import RefineGANGenerator
-from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
 from rvc.lib.algorithm.residuals import ResidualCouplingBlock
-from rvc.lib.algorithm.encoders import TextEncoder, PosteriorEncoder
+
+# Scales the prior's noise at inference, trading variety for stability.
+INFERENCE_NOISE_SCALE = 0.66666
+
+type LatentStats = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 class Synthesizer(torch.nn.Module):
-    """
-    Base Synthesizer model.
+    """RVC v2 voice model with pitch guidance: a VITS-style conditional VAE with a HiFi-GAN NSF decoder.
+
+    Training encodes the target audio's spectrogram to a latent (enc_q), maps it through the flow
+    toward the prior predicted from content features and pitch (enc_p), and decodes a random
+    slice of the latent to audio (dec). Conversion samples from the prior, inverts the flow,
+    and decodes.
+
+    The positional arguments follow the "config" list saved in exported voice models, so a model
+    can be rebuilt with Synthesizer(*config, use_f0=True, text_enc_hidden_dim=768).
 
     Args:
-        spec_channels (int): Number of channels in the spectrogram.
-        segment_size (int): Size of the audio segment.
-        inter_channels (int): Number of channels in the intermediate layers.
-        hidden_channels (int): Number of channels in the hidden layers.
-        filter_channels (int): Number of channels in the filter layers.
-        n_heads (int): Number of attention heads.
-        n_layers (int): Number of layers in the encoder.
-        kernel_size (int): Size of the convolution kernel.
-        p_dropout (float): Dropout probability.
-        resblock (str): Type of residual block.
-        resblock_kernel_sizes (list): Kernel sizes for the residual blocks.
-        resblock_dilation_sizes (list): Dilation sizes for the residual blocks.
-        upsample_rates (list): Upsampling rates for the decoder.
-        upsample_initial_channel (int): Number of channels in the initial upsampling layer.
-        upsample_kernel_sizes (list): Kernel sizes for the upsampling layers.
-        spk_embed_dim (int): Dimension of the speaker embedding.
-        gin_channels (int): Number of channels in the global conditioning vector.
-        sr (int): Sampling rate of the audio.
-        use_f0 (bool): Whether to use F0 information.
-        text_enc_hidden_dim (int): Hidden dimension for the text encoder.
-        kwargs: Additional keyword arguments.
+        spec_channels: Linear spectrogram bins.
+        segment_size: Latent frames per training slice.
+        inter_channels: Channels of the latent.
+        hidden_channels: Channels inside the encoders and flow.
+        filter_channels: Channels inside the text encoder's feed-forward networks.
+        n_heads: Attention heads.
+        n_layers: Text encoder layers.
+        kernel_size: Kernel size of the text encoder's feed-forward convolutions.
+        p_dropout: Dropout probability.
+        resblock: Residual block type. Only "1" exists in RVC v2.
+        resblock_kernel_sizes: Decoder residual block kernel sizes.
+        resblock_dilation_sizes: Decoder residual block dilations.
+        upsample_rates: Decoder upsampling factors.
+        upsample_initial_channel: Decoder channels before upsampling.
+        upsample_kernel_sizes: Decoder upsampling kernel sizes.
+        spk_embed_dim: Number of speakers.
+        gin_channels: Size of the speaker embedding.
+        sr: Output sample rate in Hz.
+        use_f0: Must be True. Models without pitch guidance are not supported.
+        text_enc_hidden_dim: Size of the content features (768 for ContentVec).
+        checkpointing: Recompute decoder activations in the backward pass to save memory.
     """
 
     def __init__(
@@ -49,25 +62,23 @@ class Synthesizer(torch.nn.Module):
         kernel_size: int,
         p_dropout: float,
         resblock: str,
-        resblock_kernel_sizes: list,
-        resblock_dilation_sizes: list,
-        upsample_rates: list,
+        resblock_kernel_sizes: Sequence[int],
+        resblock_dilation_sizes: Sequence[Sequence[int]],
+        upsample_rates: Sequence[int],
         upsample_initial_channel: int,
-        upsample_kernel_sizes: list,
+        upsample_kernel_sizes: Sequence[int],
         spk_embed_dim: int,
         gin_channels: int,
         sr: int,
-        use_f0: bool,
+        use_f0: bool = True,
         text_enc_hidden_dim: int = 768,
-        vocoder: str = "HiFi-GAN",
-        randomized: bool = True,
         checkpointing: bool = False,
-        **kwargs,
-    ):
+    ) -> None:
         super().__init__()
+        if not use_f0:
+            raise ValueError("Only models with pitch guidance are supported.")
+        del resblock  # Part of the saved config, but every RVC v2 model uses the same block.
         self.segment_size = segment_size
-        self.use_f0 = use_f0
-        self.randomized = randomized
 
         self.enc_p = TextEncoder(
             inter_channels,
@@ -78,166 +89,109 @@ class Synthesizer(torch.nn.Module):
             kernel_size,
             p_dropout,
             text_enc_hidden_dim,
-            f0=use_f0,
+            f0=True,
         )
-        print(f"Using {vocoder} vocoder")
-        if use_f0:
-            if vocoder == "MRF HiFi-GAN":
-                self.dec = HiFiGANMRFGenerator(
-                    in_channel=inter_channels,
-                    upsample_initial_channel=upsample_initial_channel,
-                    upsample_rates=upsample_rates,
-                    upsample_kernel_sizes=upsample_kernel_sizes,
-                    resblock_kernel_sizes=resblock_kernel_sizes,
-                    resblock_dilations=resblock_dilation_sizes,
-                    gin_channels=gin_channels,
-                    sample_rate=sr,
-                    harmonic_num=8,
-                    checkpointing=checkpointing,
-                )
-            elif vocoder == "RefineGAN":
-                self.dec = RefineGANGenerator(
-                    sample_rate=sr,
-                    downsample_rates=upsample_rates[::-1],
-                    upsample_rates=upsample_rates,
-                    start_channels=16,
-                    num_mels=inter_channels,
-                    checkpointing=checkpointing,
-                )
-            else:
-                self.dec = HiFiGANNSFGenerator(
-                    inter_channels,
-                    resblock_kernel_sizes,
-                    resblock_dilation_sizes,
-                    upsample_rates,
-                    upsample_initial_channel,
-                    upsample_kernel_sizes,
-                    gin_channels=gin_channels,
-                    sr=sr,
-                    checkpointing=checkpointing,
-                )
-        else:
-            if vocoder == "MRF HiFi-GAN":
-                print("MRF HiFi-GAN does not support training without pitch guidance.")
-                self.dec = None
-            elif vocoder == "RefineGAN":
-                print("RefineGAN does not support training without pitch guidance.")
-                self.dec = None
-            else:
-                self.dec = HiFiGANGenerator(
-                    inter_channels,
-                    resblock_kernel_sizes,
-                    resblock_dilation_sizes,
-                    upsample_rates,
-                    upsample_initial_channel,
-                    upsample_kernel_sizes,
-                    gin_channels=gin_channels,
-                )
+        self.dec = HiFiGANNSFGenerator(
+            inter_channels,
+            resblock_kernel_sizes,
+            resblock_dilation_sizes,
+            upsample_rates,
+            upsample_initial_channel,
+            upsample_kernel_sizes,
+            gin_channels=gin_channels,
+            sr=sr,
+            checkpointing=checkpointing,
+        )
         self.enc_q = PosteriorEncoder(
-            spec_channels,
-            inter_channels,
-            hidden_channels,
-            5,
-            1,
-            16,
-            gin_channels=gin_channels,
+            spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels
         )
-        self.flow = ResidualCouplingBlock(
-            inter_channels,
-            hidden_channels,
-            5,
-            1,
-            3,
-            gin_channels=gin_channels,
-        )
+        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 3, gin_channels=gin_channels)
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
 
-    def _remove_weight_norm_from(self, module):
-        for hook in module._forward_pre_hooks.values():
-            if getattr(hook, "__class__", None).__name__ == "WeightNorm":
-                torch.nn.utils.remove_weight_norm(module)
+    @classmethod
+    def from_config(
+        cls, model: ModelConfig, spec_channels: int, segment_size: int, sample_rate: int, checkpointing: bool = False
+    ) -> Self:
+        return cls(
+            spec_channels,
+            segment_size,
+            model.inter_channels,
+            model.hidden_channels,
+            model.filter_channels,
+            model.n_heads,
+            model.n_layers,
+            model.kernel_size,
+            model.p_dropout,
+            model.resblock,
+            model.resblock_kernel_sizes,
+            model.resblock_dilation_sizes,
+            model.upsample_rates,
+            model.upsample_initial_channel,
+            model.upsample_kernel_sizes,
+            model.spk_embed_dim,
+            model.gin_channels,
+            sample_rate,
+            text_enc_hidden_dim=model.text_enc_hidden_dim,
+            checkpointing=checkpointing,
+        )
 
-    def remove_weight_norm(self):
-        for module in [self.dec, self.flow, self.enc_q]:
-            self._remove_weight_norm_from(module)
-
-    def __prepare_scriptable__(self):
-        self.remove_weight_norm()
-        return self
+    def remove_weight_norm(self) -> None:
+        remove_weight_norm(self)
 
     def forward(
         self,
         phone: torch.Tensor,
         phone_lengths: torch.Tensor,
-        pitch: Optional[torch.Tensor] = None,
-        pitchf: Optional[torch.Tensor] = None,
-        y: Optional[torch.Tensor] = None,
-        y_lengths: Optional[torch.Tensor] = None,
-        ds: Optional[torch.Tensor] = None,
-    ):
+        pitch: torch.Tensor,
+        pitchf: torch.Tensor,
+        y: torch.Tensor,
+        y_lengths: torch.Tensor,
+        ds: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, LatentStats]:
+        """Training pass: decode a random slice of the latent of spectrogram y.
+
+        Returns the generated audio slice, the slice start frames, the prior and posterior masks,
+        and (z, z_p, m_p, logs_p, m_q, logs_q) for the KL loss.
+        """
         g = self.emb_g(ds).unsqueeze(-1)
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+        z_p = self.flow(z, y_mask, g=g)
+        z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size)
+        pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
+        o = self.dec(z_slice, pitchf, g=g)
+        return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
-        if y is not None:
-            z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
-            z_p = self.flow(z, y_mask, g=g)
-            # regular old training method using random slices
-            if self.randomized:
-                z_slice, ids_slice = rand_slice_segments(
-                    z, y_lengths, self.segment_size
-                )
-                if self.use_f0:
-                    pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
-                    o = self.dec(z_slice, pitchf, g=g)
-                else:
-                    o = self.dec(z_slice, g=g)
-                return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
-            # future use for finetuning using the entire dataset each pass
-            else:
-                if self.use_f0:
-                    o = self.dec(z, pitchf, g=g)
-                else:
-                    o = self.dec(z, g=g)
-                return o, None, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
-        else:
-            return None, None, x_mask, None, (None, None, m_p, logs_p, None, None)
-
-    @torch.jit.export
     def infer(
         self,
         phone: torch.Tensor,
         phone_lengths: torch.Tensor,
-        pitch: Optional[torch.Tensor] = None,
-        nsff0: Optional[torch.Tensor] = None,
-        sid: torch.Tensor = None,
-        rate: Optional[torch.Tensor] = None,
-    ):
-        """
-        Inference of the model.
+        pitch: torch.Tensor,
+        nsff0: torch.Tensor,
+        sid: torch.Tensor,
+        rate: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Convert content features and pitch to audio in the voice of speaker sid.
 
         Args:
-            phone (torch.Tensor): Phoneme sequence.
-            phone_lengths (torch.Tensor): Lengths of the phoneme sequences.
-            pitch (torch.Tensor, optional): Pitch sequence.
-            nsff0 (torch.Tensor, optional): Fine-grained pitch sequence.
-            sid (torch.Tensor): Speaker embedding.
-            rate (torch.Tensor, optional): Rate for time-stretching.
+            phone: Content features, [batch, frames, text_enc_hidden_dim].
+            phone_lengths: Frames per batch item.
+            pitch: Coarse pitch bins, [batch, frames].
+            nsff0: Pitch in Hz, [batch, frames].
+            sid: Speaker ids, [batch].
+            rate: If given, decode only this final fraction of the frames.
+
+        Returns the audio, the frame mask, and (z, z_p, m_p, logs_p).
         """
         g = self.emb_g(sid).unsqueeze(-1)
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * INFERENCE_NOISE_SCALE) * x_mask
 
         if rate is not None:
             head = int(z_p.shape[2] * (1.0 - rate.item()))
             z_p, x_mask = z_p[:, :, head:], x_mask[:, :, head:]
-            if self.use_f0 and nsff0 is not None:
-                nsff0 = nsff0[:, head:]
+            nsff0 = nsff0[:, head:]
 
         z = self.flow(z_p, x_mask, g=g, reverse=True)
-        o = (
-            self.dec(z * x_mask, nsff0, g=g)
-            if self.use_f0
-            else self.dec(z * x_mask, g=g)
-        )
-
+        o = self.dec(z * x_mask, nsff0, g=g)
         return o, x_mask, (z, z_p, m_p, logs_p)

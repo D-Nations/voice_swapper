@@ -1,35 +1,40 @@
+"""Stage 3: fine-tune the pretrained generator and discriminator on one voice.
+
+Reads <experiment dir>/config.json and filelist.txt from the extract stage. Every
+--save-every epochs it overwrites G_latest.pth and D_latest.pth, which let an interrupted run
+resume, and exports a small voice model, <name>_<epoch>e_<step>s.pth, for conversion.
+TensorBoard logs go to <experiment dir>/eval.
+
+Run with: python -m rvc.train.train --experiment-dir DIR --pretrained-g G.pth --pretrained-d D.pth
+"""
+
+import argparse
+import dataclasses
+import datetime
 import os
 import sys
-
-os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
-import datetime
-import glob
-import json
+import time
 from collections import deque
-from random import randint, shuffle
-from time import time as ttime
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
 
-import numpy as np
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn import functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from rvc.runtime import LOGS_DIR, PRECISION
-
+from rvc.configs.config import RVCConfig
+from rvc.lib.algorithm import commons
+from rvc.lib.algorithm.discriminators import MultiPeriodDiscriminator
+from rvc.lib.algorithm.synthesizers import Synthesizer
+from rvc.runtime import PRECISION
+from rvc.train.data_utils import BucketBatchSampler, TextAudioLoaderMultiNSFsid, TrainingBatch, collate
 from rvc.train.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
-from rvc.train.mel_processing import (
-    MultiScaleMelSpectrogramLoss,
-    mel_spectrogram_torch,
-    spec_to_mel_torch,
-)
+from rvc.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from rvc.train.model_info import read_model_info
+from rvc.train.process.extract_model import export_voice_model
 from rvc.train.utils import (
-    HParams,
     latest_checkpoint_path,
     load_checkpoint,
     load_wav_to_torch,
@@ -38,801 +43,171 @@ from rvc.train.utils import (
     summarize,
 )
 
-# Zluda hijack
-import rvc.lib.zluda
-from rvc.lib.algorithm import commons
-from rvc.train.process.extract_model import extract_model
+type Precision = Literal["fp32", "fp16", "bf16"]
 
-# Parse command line arguments
-model_name = sys.argv[1]
-save_every_epoch = int(sys.argv[2])
-total_epoch = int(sys.argv[3])
-pretrainG = sys.argv[4]
-pretrainD = sys.argv[5]
-gpus = sys.argv[6]
-batch_size = int(sys.argv[7])
-sample_rate = int(sys.argv[8])
+BUCKET_BOUNDARIES = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+LOADER_WORKERS = 4
+LOADER_PREFETCH = 8
+LOG_EVERY_STEPS = 50
+MIN_BATCHES = 3
 
 
-def _strtobool(val):
-    return val.lower() in ("yes", "true", "t", "y", "1")
+@dataclass(frozen=True)
+class TrainingOptions:
+    experiment_dir: Path
+    pretrained_g: Path | None
+    pretrained_d: Path | None
+    total_epochs: int = 300
+    save_every_epochs: int = 10
+    batch_size: int = 8
+    device: str = "cuda:0"
+    precision: Precision = "fp16"
+    export_every_save: bool = True  # Export a voice model at every save, not only the last.
+    checkpointing: bool = False  # Trade speed for memory.
+
+    @property
+    def name(self) -> str:
+        return self.experiment_dir.name
 
 
-save_only_latest = _strtobool(sys.argv[9])
-save_every_weights = _strtobool(sys.argv[10])
-cache_data_in_gpu = _strtobool(sys.argv[11])
-cleanup = _strtobool(sys.argv[12])
-vocoder = sys.argv[13]
-checkpointing = _strtobool(sys.argv[14])
-# experimental settings
-randomized = True
-d_lr_coeff = 1.0
-g_lr_coeff = 1.0
-d_step_per_g_step = 1
-multiscale_mel_loss = False
-bf16_adamw = False
-disc_version = "v2"
+@dataclass
+class TrainingState:
+    """What carries over between epochs."""
 
-if vocoder == "RefineGAN":
-    disc_version = "v3"
-    multiscale_mel_loss = True
-
-if PRECISION == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-    train_dtype = torch.bfloat16
-elif PRECISION == "fp16" and torch.cuda.is_available():
-    train_dtype = torch.float16
-else:
-    train_dtype = torch.float32
-
-experiment_dir = str(LOGS_DIR / model_name)
-config_save_path = os.path.join(experiment_dir, "config.json")
-dataset_path = os.path.join(experiment_dir, "sliced_audios")
-model_info_path = os.path.join(experiment_dir, "model_info.json")
-
-try:
-    with open(config_save_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    config = HParams(**config)
-except FileNotFoundError:
-    print(
-        f"Config file not found at {config_save_path}. Did you run preprocessing and feature extraction steps?"
-    )
-    sys.exit(1)
-
-config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
-
-torch.backends.cudnn.deterministic = False
-if os.name == "nt":  # Windows
-    torch.backends.cudnn.benchmark = True
-
-# TF32 settings, should improve performance in some cases
-try:
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-except Exception as e:
-    print(f"Torch tf32: {e}")
-
-global_step = 0
-last_loss_gen_all = 0
-lowest_value = {"step": 0, "value": float("inf"), "epoch": 0}
-training_file_path = os.path.join(experiment_dir, "training_data.json")
-
-avg_losses = {
-    "grad_d_50": deque(maxlen=50),
-    "grad_g_50": deque(maxlen=50),
-    "disc_loss_50": deque(maxlen=50),
-    "adv_loss_50": deque(maxlen=50),
-    "fm_loss_50": deque(maxlen=50),
-    "kl_loss_50": deque(maxlen=50),
-    "mel_loss_50": deque(maxlen=50),
-    "gen_loss_50": deque(maxlen=50),
-}
-
-import logging
-
-logging.getLogger("torch").setLevel(logging.ERROR)
-
-
-class EpochRecorder:
-    """
-    Records the time elapsed per epoch.
-    """
-
-    def __init__(self):
-        self.last_time = ttime()
-
-    def record(self):
-        """
-        Records the elapsed time and returns a formatted string.
-        """
-        now_time = ttime()
-        elapsed_time = now_time - self.last_time
-        self.last_time = now_time
-        elapsed_time = round(elapsed_time, 1)
-        elapsed_time_str = str(datetime.timedelta(seconds=int(elapsed_time)))
-        current_time = datetime.datetime.now().strftime("%H:%M:%S")
-        return f"time={current_time} | training_speed={elapsed_time_str}"
-
-
-def main():
-    """
-    Main function to start the training process.
-    """
-    global training_file_path, last_loss_gen_all, gpus
-
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(randint(20000, 55555))
-    # Check sample rate
-    wavs = glob.glob(
-        os.path.join(os.path.join(experiment_dir, "sliced_audios"), "*.wav")
-    )
-    if wavs:
-        _, sr = load_wav_to_torch(wavs[0])
-        if sr != config.data.sample_rate:
-            print(
-                f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz)."
-            )
-            os._exit(1)
-    else:
-        print("No wav file found.")
-
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        gpus = [int(item) for item in gpus.split("-")]
-        n_gpus = len(gpus)
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        gpus = [0]
-        n_gpus = 1
-    else:
-        device = torch.device("cpu")
-        gpus = [0]
-        n_gpus = 1
-        print("Training with CPU, this will take a long time.")
-
-    def start():
-        """
-        Starts the training process with multi-GPU support or CPU.
-        """
-        children = []
-        pid_data = {"process_pids": []}
-        with open(config_save_path, "r", encoding="utf-8") as pid_file:
-            try:
-                existing_data = json.load(pid_file)
-                pid_data.update(existing_data)
-            except json.JSONDecodeError:
-                pass
-        with open(config_save_path, "w") as pid_file:
-            for rank, device_id in enumerate(gpus):
-                subproc = mp.Process(
-                    target=run,
-                    args=(
-                        rank,
-                        n_gpus,
-                        experiment_dir,
-                        pretrainG,
-                        pretrainD,
-                        total_epoch,
-                        save_every_weights,
-                        config,
-                        device,
-                        device_id,
-                    ),
-                )
-                children.append(subproc)
-                subproc.start()
-                pid_data["process_pids"].append(subproc.pid)
-            json.dump(pid_data, pid_file, indent=4)
-
-        for i in range(n_gpus):
-            children[i].join()
-
-    if cleanup:
-        print("Removing files from the prior training attempt...")
-
-        # Clean up unnecessary files
-        for root, dirs, files in os.walk(
-            experiment_dir, topdown=False
-        ):
-            for name in files:
-                file_path = os.path.join(root, name)
-                file_name, file_extension = os.path.splitext(name)
-                if (
-                    file_extension == ".0"
-                    or (file_name.startswith("D_") and file_extension == ".pth")
-                    or (file_name.startswith("G_") and file_extension == ".pth")
-                    or (file_name.startswith("added") and file_extension == ".index")
-                ):
-                    os.remove(file_path)
-            for name in dirs:
-                if name == "eval":
-                    folder_path = os.path.join(root, name)
-                    for item in os.listdir(folder_path):
-                        item_path = os.path.join(folder_path, item)
-                        if os.path.isfile(item_path):
-                            os.remove(item_path)
-                    os.rmdir(folder_path)
-
-        print("Cleanup done!")
-
-    start()
-
-
-def run(
-    rank,
-    n_gpus,
-    experiment_dir,
-    pretrainG,
-    pretrainD,
-    custom_total_epoch,
-    custom_save_every_weights,
-    config,
-    device,
-    device_id,
-):
-    """
-    Runs the training loop on a specific GPU or CPU.
-
-    Args:
-        rank (int): The rank of the current process within the distributed training setup.
-        n_gpus (int): The total number of GPUs available for training.
-        experiment_dir (str): The directory where experiment logs and checkpoints will be saved.
-        pretrainG (str): Path to the pre-trained generator model.
-        pretrainD (str): Path to the pre-trained discriminator model.
-        custom_total_epoch (int): The total number of epochs for training.
-        custom_save_every_weights (int): The interval (in epochs) at which to save model weights.
-        config (object): Configuration object containing training parameters.
-        device (torch.device): The device to use for training (CPU or GPU).
-    """
-    global global_step
-
-    if rank == 0:
-        writer_eval = SummaryWriter(log_dir=os.path.join(experiment_dir, "eval"))
-    else:
-        writer_eval = None
-
-    dist.init_process_group(
-        backend="gloo" if sys.platform == "win32" or device.type != "cuda" else "nccl",
-        init_method="env://",
-        world_size=n_gpus if device.type == "cuda" else 1,
-        rank=rank if device.type == "cuda" else 0,
+    global_step: int = 0
+    lowest_loss: float = float("inf")
+    lowest_loss_epoch: int = 0
+    lowest_loss_step: int = 0
+    rolling: dict[str, deque[float | torch.Tensor]] = field(
+        default_factory=lambda: {
+            name: deque(maxlen=LOG_EVERY_STEPS)
+            for name in ("grad_d", "grad_g", "disc_loss", "adv_loss", "fm_loss", "kl_loss", "mel_loss", "gen_loss")
+        }
     )
 
-    torch.manual_seed(config.train.seed)
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device_id)
+@dataclass
+class Trainer:
+    options: TrainingOptions
+    config: RVCConfig
+    device: torch.device
+    train_dtype: torch.dtype
+    net_g: Synthesizer
+    net_d: MultiPeriodDiscriminator
+    optim_g: torch.optim.Optimizer
+    optim_d: torch.optim.Optimizer
+    scaler: torch.amp.GradScaler
+    loader: DataLoader
+    sampler: BucketBatchSampler
+    writer: SummaryWriter
+    reference: TrainingBatch
+    state: TrainingState = field(default_factory=TrainingState)
 
-    # Create datasets and dataloaders
-    from data_utils import (
-        DistributedBucketSampler,
-        TextAudioCollateMultiNSFsid,
-        TextAudioLoaderMultiNSFsid,
-    )
+    @property
+    def use_amp(self) -> bool:
+        return self.device.type == "cuda" and self.train_dtype in (torch.float16, torch.bfloat16)
 
-    train_dataset = TextAudioLoaderMultiNSFsid(config.data)
-    collate_fn = TextAudioCollateMultiNSFsid()
-    train_sampler = DistributedBucketSampler(
-        train_dataset,
-        batch_size,
-        [50, 100, 200, 300, 400, 500, 600, 700, 800, 900],
-        num_replicas=n_gpus,
-        rank=rank,
-        shuffle=True,
-    )
+    def autocast(self) -> torch.autocast:
+        return torch.autocast(device_type="cuda", enabled=self.use_amp, dtype=self.train_dtype)
 
-    train_loader = DataLoader(
-        train_dataset,
-        num_workers=4,
-        shuffle=False,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=8,
-    )
-
-    # Validations
-    if len(train_loader) < 3:
-        print(
-            "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
-        )
-        os._exit(2333333)
-
-    # defaults
-    embedder_name = "contentvec"
-    spk_dim = config.model.spk_embed_dim  # 109 default speakers
-
-    try:
-        with open(model_info_path, "r", encoding="utf-8") as f:
-            model_info = json.load(f)
-            embedder_name = model_info["embedder_model"]
-            spk_dim = model_info["speakers_id"]
-    except Exception as e:
-        print(f"Could not load model info file: {e}. Using defaults.")
-    print(f"Dataset has {spk_dim} speakers.")
-    # Try to load speaker dim from latest checkpoint
-    try:
-        chk_path = latest_checkpoint_path(experiment_dir, "G_*.pth")
-
-        if chk_path:
-            ckpt = torch.load(chk_path, map_location="cpu", weights_only=True)
-            spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
-            print(f"Saved generator has {spk_dim} speakers.")
-            del ckpt
-    except Exception as e:
-        print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
-
-    # update config before the model init
-    print(f"Initializing the generator with {spk_dim} speakers.")
-    config.model.spk_embed_dim = spk_dim
-
-    # Initialize models and optimizers
-    from rvc.lib.algorithm.discriminators import MultiPeriodDiscriminator
-    from rvc.lib.algorithm.synthesizers import Synthesizer
-
-    net_g = Synthesizer(
-        config.data.filter_length // 2 + 1,
-        config.train.segment_size // config.data.hop_length,
-        **config.model,
-        use_f0=True,
-        sr=config.data.sample_rate,
-        vocoder=vocoder,
-        checkpointing=checkpointing,
-        randomized=randomized,
-    )
-
-    net_d = MultiPeriodDiscriminator(
-        config.model.use_spectral_norm,
-        checkpointing=checkpointing,
-        version=disc_version,
-    )
-
-    if torch.cuda.is_available():
-        net_g = net_g.cuda(device_id)
-        net_d = net_d.cuda(device_id)
-    else:
-        net_g = net_g.to(device)
-        net_d = net_d.to(device)
-
-    if bf16_adamw == True and train_dtype == torch.bfloat16:
-        print("Using BFload16 AdamW optimizer")
-        from rvc.train.anyprecision_optimizer import AnyPrecisionAdamW
-
-        optimizer = AnyPrecisionAdamW
-    else:
-        print("Using AdamW optimizer")
-        optimizer = torch.optim.AdamW
-
-    optim_g = optimizer(
-        net_g.parameters(),
-        config.train.learning_rate * g_lr_coeff,
-        betas=config.train.betas,
-        eps=config.train.eps,
-    )
-    optim_d = optimizer(
-        net_d.parameters(),
-        config.train.learning_rate * d_lr_coeff,
-        betas=config.train.betas,
-        eps=config.train.eps,
-    )
-    if multiscale_mel_loss:
-        fn_mel_loss = MultiScaleMelSpectrogramLoss(sample_rate=config.data.sample_rate)
-        print("Using Multi-Scale Mel loss function")
-    else:
-        fn_mel_loss = torch.nn.L1Loss()
-        print("Using Single-Scale Mel loss function")
-
-    # Wrap models with DDP for multi-gpu processing
-    if n_gpus > 1 and device.type == "cuda":
-        net_g = DDP(net_g, device_ids=[device_id])
-        net_d = DDP(net_d, device_ids=[device_id])
-
-    if rank == 0 and train_dtype == torch.bfloat16:
-        print("Using BFloat16 for training.")
-    elif rank == 0 and train_dtype == torch.float16:
-        print("Using Float16 for training.")
-
-    # Load checkpoint if available
-    scaler_dict = {}
-    try:
-        print("Starting training...")
-        _, _, _, epoch_str, scaler_dict = load_checkpoint(
-            latest_checkpoint_path(experiment_dir, "D_*.pth"), net_d, optim_d
-        )
-        _, _, _, epoch_str, _ = load_checkpoint(
-            latest_checkpoint_path(experiment_dir, "G_*.pth"), net_g, optim_g
-        )
-        epoch_str += 1
-        global_step = (epoch_str - 1) * len(train_loader)
-
-    except Exception as e:
-        epoch_str = 1
-        global_step = 0
-
-        if pretrainG not in ("", "None"):
-            if rank == 0:
-                print(f"Loaded pretrained (G) '{pretrainG}'")
-            try:
-                ckpt = torch.load(pretrainG, map_location="cpu", weights_only=True)[
-                    "model"
-                ]
-                print(
-                    f"Overriding the pretrain speaker embedding size to {spk_dim} speakers."
-                )
-                if hasattr(net_g, "module"):
-                    ckpt["emb_g.weight"] = net_g.module.emb_g.weight.detach().clone()
-                    net_g.module.load_state_dict(ckpt)
-                else:
-                    ckpt["emb_g.weight"] = net_g.emb_g.weight.detach().clone()
-                    net_g.load_state_dict(ckpt)
-                del ckpt
-            except Exception as e:
-                print(
-                    "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
-                )
-                print(e)
-                sys.exit(1)
-
-        if pretrainD not in ("", "None"):
-            if rank == 0:
-                print(f"Loaded pretrained (D) '{pretrainD}'")
-            try:
-                ckpt = torch.load(pretrainD, map_location="cpu", weights_only=True)[
-                    "model"
-                ]
-                if hasattr(net_d, "module"):
-                    net_d.module.load_state_dict(ckpt)
-                else:
-                    net_d.load_state_dict(ckpt)
-                del ckpt
-            except Exception as e:
-                print(
-                    "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
-                )
-                print(e)
-                sys.exit(1)
-
-    # Initialize schedulers
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=config.train.lr_decay, last_epoch=epoch_str - 2
-    )
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=config.train.lr_decay, last_epoch=epoch_str - 2
-    )
-
-    use_scaler = device.type == "cuda" and train_dtype == torch.float16
-    scaler = torch.amp.GradScaler(enabled=use_scaler)
-    if len(scaler_dict) > 0:
-        scaler.load_state_dict(scaler_dict)
-
-    cache = []
-    # collect the reference audio for tensorboard evaluation
-    reference_dir = LOGS_DIR / "reference"
-    if os.path.isfile(os.path.join(reference_dir, embedder_name, "feats.npy")):
-        print("Using", embedder_name, "reference set for validation")
-        phone = np.load(os.path.join(reference_dir, embedder_name, "feats.npy"))
-        # expanding x2 to match pitch size
-        phone = np.repeat(phone, 2, axis=0)
-        phone_lengths = torch.LongTensor([phone.shape[0]]).to(device)
-        phone = torch.FloatTensor(phone).unsqueeze(0).to(device)
-        pitch = np.load(os.path.join(reference_dir, "pitch_coarse.npy"))
-        # removed last frame to match features
-        pitch = torch.LongTensor(pitch[:-1]).unsqueeze(0).to(device)
-        pitchf = np.load(os.path.join(reference_dir, "pitch_fine.npy"))
-        # removed last frame to match features
-        pitchf = torch.FloatTensor(pitchf[:-1]).unsqueeze(0).to(device)
-        sid = torch.LongTensor([0]).to(device)
-        reference = (
-            phone,
-            phone_lengths,
-            pitch,
-            pitchf,
-            sid,
-        )
-    else:
-        print("No custom reference found, using a default audio sample for validation")
-        info = next(iter(train_loader))
-        phone, phone_lengths, pitch, pitchf, _, _, _, _, sid = info
-        reference = (
-            phone.to(device),
-            phone_lengths.to(device),
-            pitch.to(device),
-            pitchf.to(device),
-            sid.to(device),
+    def mel(self, audio: torch.Tensor) -> torch.Tensor:
+        data = self.config.data
+        return mel_spectrogram_torch(
+            audio.float().squeeze(1),
+            data.filter_length,
+            data.n_mel_channels,
+            data.sample_rate,
+            data.hop_length,
+            data.win_length,
+            data.mel_fmin,
+            data.mel_fmax,
         )
 
-    for epoch in range(epoch_str, total_epoch + 1):
-        train_and_evaluate(
-            rank,
-            epoch,
-            config,
-            [net_g, net_d],
-            [optim_g, optim_d],
-            [train_loader, None],
-            [writer_eval],
-            cache,
-            custom_save_every_weights,
-            custom_total_epoch,
-            device,
-            device_id,
-            reference,
-            fn_mel_loss,
-            scaler,
-        )
-
-        scheduler_g.step()
-        scheduler_d.step()
-
-
-def train_and_evaluate(
-    rank,
-    epoch,
-    hps,
-    nets,
-    optims,
-    loaders,
-    writers,
-    cache,
-    custom_save_every_weights,
-    custom_total_epoch,
-    device,
-    device_id,
-    reference,
-    fn_mel_loss,
-    scaler,
-):
-    """
-    Trains and evaluates the model for one epoch.
-
-    Args:
-        rank (int): Rank of the current process.
-        epoch (int): Current epoch number.
-        hps (Namespace): Hyperparameters.
-        nets (list): List of models [net_g, net_d].
-        optims (list): List of optimizers [optim_g, optim_d].
-        loaders (list): List of dataloaders [train_loader, eval_loader].
-        writers (list): List of TensorBoard writers [writer_eval].
-        cache (list): List to cache data in GPU memory.
-        use_cpu (bool): Whether to use CPU for training.
-    """
-    global global_step, lowest_value, loss_disc
-
-    if epoch == 1:
-        lowest_value = {"step": 0, "value": float("inf"), "epoch": 0}
-
-    net_g, net_d = nets
-    optim_g, optim_d = optims
-    train_loader = loaders[0] if loaders is not None else None
-    if writers is not None:
-        writer = writers[0]
-
-    train_loader.batch_sampler.set_epoch(epoch)
-
-    net_g.train()
-    net_d.train()
-
-    use_amp = device.type == "cuda" and (
-        train_dtype == torch.bfloat16 or train_dtype == torch.float16
-    )
-
-    # Data caching
-    if device.type == "cuda" and cache_data_in_gpu:
-        data_iterator = cache
-        if cache == []:
-            for batch_idx, info in enumerate(train_loader):
-                # phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, wave_lengths, sid
-                info = [tensor.cuda(device_id, non_blocking=True) for tensor in info]
-                cache.append((batch_idx, info))
+    def backward_and_step(
+        self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, model: torch.nn.Module, update_scaler: bool
+    ) -> float:
+        """Backpropagate, step, and return the gradient norm. fp16 losses are scaled to avoid underflow."""
+        optimizer.zero_grad()
+        if self.train_dtype == torch.float16:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(optimizer)
+            norm = commons.grad_norm(model.parameters())
+            self.scaler.step(optimizer)
+            if update_scaler:
+                self.scaler.update()
         else:
-            shuffle(cache)
-    else:
-        data_iterator = enumerate(train_loader)
+            loss.backward()
+            norm = commons.grad_norm(model.parameters())
+            optimizer.step()
+        return norm
 
-    epoch_recorder = EpochRecorder()
-    with tqdm(total=len(train_loader), leave=False) as pbar:
-        for batch_idx, info in data_iterator:
-            if device.type == "cuda" and not cache_data_in_gpu:
-                info = [tensor.cuda(device_id, non_blocking=True) for tensor in info]
-            elif device.type != "cuda":
-                info = [tensor.to(device) for tensor in info]
-            # else iterator is going thru a cached list with a device already assigned
+    def train_epoch(self, epoch: int) -> None:
+        config, state = self.config, self.state
+        self.sampler.set_epoch(epoch)
+        self.net_g.train()
+        self.net_d.train()
+        started = time.time()
 
-            (
-                phone,
-                phone_lengths,
-                pitch,
-                pitchf,
-                spec,
-                spec_lengths,
-                wave,
-                wave_lengths,
-                sid,
-            ) = info
-
-            with torch.amp.autocast(
-                device_type="cuda", enabled=use_amp, dtype=train_dtype
-            ):
-                # Forward pass
-                model_output = net_g(
-                    phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
+        for batch in tqdm(self.loader, leave=False):
+            batch = batch.to(self.device, non_blocking=True)
+            with self.autocast():
+                y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
+                    batch.phone,
+                    batch.phone_lengths,
+                    batch.pitch,
+                    batch.pitchf,
+                    batch.spec,
+                    batch.spec_lengths,
+                    batch.sid,
                 )
-                y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (
-                    model_output
+                # The matching slice of the real audio.
+                wave = commons.slice_segments(
+                    batch.wave, ids_slice * config.data.hop_length, config.train.segment_size, dim=3
                 )
-                # slice of the original waveform to match a generate slice
-                if randomized:
-                    wave = commons.slice_segments(
-                        wave,
-                        ids_slice * config.data.hop_length,
-                        config.train.segment_size,
-                        dim=3,
-                    )
-            for _ in range(d_step_per_g_step):  # default x1
-                with torch.amp.autocast(
-                    device_type="cuda", enabled=use_amp, dtype=train_dtype
-                ):
-                    y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-                loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
-                # Discriminator backward and update
-                optim_d.zero_grad()
-                if train_dtype == torch.float16:
-                    scaler.scale(loss_disc).backward()
-                    scaler.unscale_(optim_d)
-                    grad_norm_d = commons.grad_norm(net_d.parameters())
-                    scaler.step(optim_d)
-                else:
-                    loss_disc.backward()
-                    grad_norm_d = commons.grad_norm(net_d.parameters())
-                    optim_d.step()
 
-            net_d.requires_grad_(False)
+            with self.autocast():
+                y_d_hat_r, y_d_hat_g, _, _ = self.net_d(wave, y_hat.detach())
+            loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g)
+            grad_norm_d = self.backward_and_step(loss_disc, self.optim_d, self.net_d, update_scaler=False)
 
-            with torch.amp.autocast(
-                device_type="cuda", enabled=use_amp, dtype=train_dtype
-            ):
-                # Generator backward and update
-                _, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
-
-            if multiscale_mel_loss:
-                loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
-            else:
-                wave_mel = mel_spectrogram_torch(
-                    wave.float().squeeze(1),
-                    config.data.filter_length,
-                    config.data.n_mel_channels,
-                    config.data.sample_rate,
-                    config.data.hop_length,
-                    config.data.win_length,
-                    config.data.mel_fmin,
-                    config.data.mel_fmax,
-                )
-                y_hat_mel = mel_spectrogram_torch(
-                    y_hat.float().squeeze(1),
-                    config.data.filter_length,
-                    config.data.n_mel_channels,
-                    config.data.sample_rate,
-                    config.data.hop_length,
-                    config.data.win_length,
-                    config.data.mel_fmin,
-                    config.data.mel_fmax,
-                )
-                loss_mel = fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
+            self.net_d.requires_grad_(False)
+            with self.autocast():
+                _, y_d_hat_g, fmap_r, fmap_g = self.net_d(wave, y_hat)
+            loss_mel = torch.nn.functional.l1_loss(self.mel(wave), self.mel(y_hat)) * config.train.c_mel
             loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
             loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen, _ = generator_loss(y_d_hat_g)
+            loss_gen = generator_loss(y_d_hat_g)
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
 
-            if loss_gen_all.item() < lowest_value["value"]:
-                lowest_value = {
-                    "step": global_step,
-                    "value": loss_gen_all.item(),
-                    "epoch": epoch,
-                }
-            optim_g.zero_grad()
-            if train_dtype == torch.float16:
-                scaler.scale(loss_gen_all).backward()
-                scaler.unscale_(optim_g)
-                grad_norm_g = commons.grad_norm(net_g.parameters())
-                scaler.step(optim_g)
-                scaler.update()
-            else:
-                loss_gen_all.backward()
-                grad_norm_g = commons.grad_norm(net_g.parameters())
-                optim_g.step()
+            if loss_gen_all.item() < state.lowest_loss:
+                state.lowest_loss = loss_gen_all.item()
+                state.lowest_loss_epoch = epoch
+                state.lowest_loss_step = state.global_step
+            grad_norm_g = self.backward_and_step(loss_gen_all, self.optim_g, self.net_g, update_scaler=True)
+            self.net_d.requires_grad_(True)
+            state.global_step += 1
 
-            net_d.requires_grad_(True)
+            for name, value in (
+                ("grad_d", grad_norm_d),
+                ("grad_g", grad_norm_g),
+                ("disc_loss", loss_disc.detach()),
+                ("adv_loss", loss_gen.detach()),
+                ("fm_loss", loss_fm.detach()),
+                ("kl_loss", loss_kl.detach()),
+                ("mel_loss", loss_mel.detach()),
+                ("gen_loss", loss_gen_all.detach()),
+            ):
+                state.rolling[name].append(value)
+            if state.global_step % LOG_EVERY_STEPS == 0:
+                self.log_rolling_averages()
 
-            global_step += 1
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
-            # queue for rolling losses over 50 steps
-            avg_losses["grad_d_50"].append(grad_norm_d)
-            avg_losses["grad_g_50"].append(grad_norm_g)
-            avg_losses["disc_loss_50"].append(loss_disc.detach())
-            avg_losses["adv_loss_50"].append(loss_gen.detach())
-            avg_losses["fm_loss_50"].append(loss_fm.detach())
-            avg_losses["kl_loss_50"].append(loss_kl.detach())
-            avg_losses["mel_loss_50"].append(loss_mel.detach())
-            avg_losses["gen_loss_50"].append(loss_gen_all.detach())
-
-            if rank == 0 and global_step % 50 == 0:
-                # logging rolling averages
-                scalar_dict = {
-                    "grad_avg_50/norm_d": sum(avg_losses["grad_d_50"])
-                    / len(avg_losses["grad_d_50"]),
-                    "grad_avg_50/norm_g": sum(avg_losses["grad_g_50"])
-                    / len(avg_losses["grad_g_50"]),
-                    "loss_avg_50/d/adv": torch.mean(
-                        torch.stack(list(avg_losses["disc_loss_50"]))
-                    ),
-                    "loss_avg_50/g/adv": torch.mean(
-                        torch.stack(list(avg_losses["adv_loss_50"]))
-                    ),
-                    "loss_avg_50/g/fm": torch.mean(
-                        torch.stack(list(avg_losses["fm_loss_50"]))
-                    ),
-                    "loss_avg_50/g/kl": torch.mean(
-                        torch.stack(list(avg_losses["kl_loss_50"]))
-                    ),
-                    "loss_avg_50/g/mel": torch.mean(
-                        torch.stack(list(avg_losses["mel_loss_50"]))
-                    ),
-                    "loss_avg_50/g/total": torch.mean(
-                        torch.stack(list(avg_losses["gen_loss_50"]))
-                    ),
-                }
-                summarize(
-                    writer=writer,
-                    global_step=global_step,
-                    scalars=scalar_dict,
-                )
-
-            pbar.update(1)
-        # end of batch train
-    # end of tqdm
-    with torch.no_grad():
-        torch.cuda.empty_cache()
-
-    # Logging and checkpointing
-    if rank == 0:
-        # used for tensorboard chart - all/mel
-        mel = spec_to_mel_torch(
-            spec,
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-        # used for tensorboard chart - slice/mel_org
-        if randomized:
-            y_mel = commons.slice_segments(
-                mel,
-                ids_slice,
-                config.train.segment_size // config.data.hop_length,
-                dim=3,
-            )
-        else:
-            y_mel = mel
-        # used for tensorboard chart - slice/mel_gen
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.float().squeeze(1),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.hop_length,
-            config.data.win_length,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-
-        lr = optim_g.param_groups[0]["lr"]
-
-        scalar_dict = {
+        losses = {
             "loss/g/total": loss_gen_all,
             "loss/d/adv": loss_disc,
-            "learning_rate": lr,
+            "learning_rate": self.optim_g.param_groups[0]["lr"],
             "grad/norm_d": grad_norm_d,
             "grad/norm_g": grad_norm_g,
             "loss/g/adv": loss_gen,
@@ -840,135 +215,265 @@ def train_and_evaluate(
             "loss/g/mel": loss_mel,
             "loss/g/kl": loss_kl,
         }
+        self.log_epoch(epoch, batch, ids_slice, y_hat, losses)
+        self.print_progress(epoch, time.time() - started)
+        if epoch % self.options.save_every_epochs == 0 or epoch >= self.options.total_epochs:
+            self.save(epoch)
 
-        image_dict = {
-            "slice/mel_org": plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
-            "slice/mel_gen": plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
-            "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
+    def log_rolling_averages(self) -> None:
+        rolling = self.state.rolling
+        scalars: dict[str, float | torch.Tensor] = {
+            f"grad_avg_50/norm_{side}": sum(rolling[f"grad_{side}"]) / len(rolling[f"grad_{side}"]) for side in "dg"
         }
+        for tag, name in (
+            ("d/adv", "disc_loss"),
+            ("g/adv", "adv_loss"),
+            ("g/fm", "fm_loss"),
+            ("g/kl", "kl_loss"),
+            ("g/mel", "mel_loss"),
+            ("g/total", "gen_loss"),
+        ):
+            scalars[f"loss_avg_50/{tag}"] = torch.mean(torch.stack([torch.as_tensor(v) for v in rolling[name]]))
+        summarize(self.writer, self.state.global_step, scalars=scalars)
 
-        if epoch % save_every_epoch == 0:
-            with torch.amp.autocast(
-                device_type="cuda", enabled=use_amp, dtype=train_dtype
-            ):
-                with torch.no_grad():
-                    if hasattr(net_g, "module"):
-                        o, *_ = net_g.module.infer(*reference)
-                    else:
-                        o, *_ = net_g.infer(*reference)
-            audio_dict = {f"gen/audio_{global_step:07d}": o[0, :, :]}
-            summarize(
-                writer=writer,
-                global_step=global_step,
-                images=image_dict,
-                scalars=scalar_dict,
-                audios=audio_dict,
-                audio_sample_rate=config.data.sample_rate,
-            )
-        else:
-            summarize(
-                writer=writer,
-                global_step=global_step,
-                images=image_dict,
-                scalars=scalar_dict,
-            )
+    def log_epoch(
+        self,
+        epoch: int,
+        batch: TrainingBatch,
+        ids_slice: torch.Tensor,
+        y_hat: torch.Tensor,
+        losses: dict[str, float | torch.Tensor],
+    ) -> None:
+        """Log the last batch's losses and spectrograms, and at save epochs a conversion of the reference batch."""
+        data = self.config.data
+        mel = spec_to_mel_torch(
+            batch.spec, data.filter_length, data.n_mel_channels, data.sample_rate, data.mel_fmin, data.mel_fmax
+        )
+        y_mel = commons.slice_segments(mel, ids_slice, self.config.segment_frames, dim=3)
+        images = {
+            "slice/mel_org": plot_spectrogram_to_numpy(y_mel[0].detach().cpu().numpy()),
+            "slice/mel_gen": plot_spectrogram_to_numpy(self.mel(y_hat)[0].detach().cpu().numpy()),
+            "all/mel": plot_spectrogram_to_numpy(mel[0].detach().cpu().numpy()),
+        }
+        audios = {}
+        if epoch % self.options.save_every_epochs == 0:
+            reference = self.reference
+            with self.autocast(), torch.no_grad():
+                audio, _, _ = self.net_g.infer(
+                    reference.phone, reference.phone_lengths, reference.pitch, reference.pitchf, reference.sid
+                )
+            audios[f"gen/audio_{self.state.global_step:07d}"] = audio[0, :, :]
+        summarize(
+            self.writer,
+            self.state.global_step,
+            scalars=losses,
+            images=images,
+            audios=audios,
+            audio_sample_rate=data.sample_rate,
+        )
 
-    # Save checkpoint
-    model_add = []
-    model_del = []
-    done = False
-
-    if rank == 0:
-        # Print training progress
-        lowest_value_rounded = round(lowest_value["value"], 3)
-
-        record = f"{model_name} | epoch={epoch} | step={global_step} | {epoch_recorder.record()}"
+    def print_progress(self, epoch: int, seconds: float) -> None:
+        state = self.state
+        record = (
+            f"{self.options.name} | epoch={epoch} | step={state.global_step} | "
+            f"time={datetime.datetime.now().astimezone():%H:%M:%S} | training_speed={datetime.timedelta(seconds=int(seconds))}"
+        )
         if epoch > 1:
-            record = (
-                record
-                + f" | lowest_value={lowest_value_rounded} (epoch {lowest_value['epoch']} and step {lowest_value['step']})"
+            record += (
+                f" | lowest_value={state.lowest_loss:.3f} "
+                f"(epoch {state.lowest_loss_epoch} and step {state.lowest_loss_step})"
             )
-        print(record)
+        print(record, flush=True)
 
-        # Save weights every N epochs
-        if epoch % save_every_epoch == 0:
-            checkpoint_suffix = f"{2333333 if save_only_latest else global_step}.pth"
-            save_checkpoint(
-                net_g,
-                optim_g,
-                config.train.learning_rate,
-                epoch,
-                os.path.join(experiment_dir, "G_" + checkpoint_suffix),
-                scaler,
-            )
-            save_checkpoint(
-                net_d,
-                optim_d,
-                config.train.learning_rate,
-                epoch,
-                os.path.join(experiment_dir, "D_" + checkpoint_suffix),
-                scaler,
-            )
-            if custom_save_every_weights:
-                model_add.append(
-                    os.path.join(
-                        experiment_dir, f"{model_name}_{epoch}e_{global_step}s.pth"
-                    )
+    def save(self, epoch: int) -> None:
+        directory = self.options.experiment_dir
+        learning_rate = self.config.train.learning_rate
+        save_checkpoint(self.net_g, self.optim_g, learning_rate, epoch, directory / "G_latest.pth", self.scaler)
+        save_checkpoint(self.net_d, self.optim_d, learning_rate, epoch, directory / "D_latest.pth", self.scaler)
+        final = epoch >= self.options.total_epochs
+        if self.options.export_every_save or final:
+            model_path = directory / f"{self.options.name}_{epoch}e_{self.state.global_step}s.pth"
+            if not model_path.exists():
+                export_voice_model(
+                    self.net_g.state_dict(), self.config, self.options.name, model_path, epoch, self.state.global_step
                 )
 
-        # Check completion
-        if epoch >= custom_total_epoch:
-            print(
-                f"Training has been successfully completed with {epoch} epoch, {global_step} steps and {round(loss_gen_all.item(), 3)} loss gen."
-            )
-            print(
-                f"Lowest generator loss: {lowest_value_rounded} at epoch {lowest_value['epoch']}, step {lowest_value['step']}"
-            )
-            # Final model
-            model_add.append(
-                os.path.join(
-                    experiment_dir, f"{model_name}_{epoch}e_{global_step}s.pth"
-                )
-            )
-            done = True
 
-        # Clean-up old best epochs
-        for m in model_del:
-            os.remove(m)
+def choose_dtype(precision: Precision, device: torch.device) -> torch.dtype:
+    if precision == "bf16" and device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if precision == "fp16" and device.type == "cuda":
+        return torch.float16
+    return torch.float32
 
-        if model_add:
-            ckpt = (
-                net_g.module.state_dict()
-                if hasattr(net_g, "module")
-                else net_g.state_dict()
-            )
-            for m in model_add:
-                if not os.path.exists(m):
-                    extract_model(
-                        ckpt=ckpt,
-                        sr=config.data.sample_rate,
-                        name=model_name,
-                        model_path=m,
-                        epoch=epoch,
-                        step=global_step,
-                        hps=hps,
-                        vocoder=vocoder,
-                    )
 
-        if done:
-            # Clean-up process IDs from config.json
-            pid_file_path = os.path.join(experiment_dir, "config.json")
-            with open(pid_file_path, "r", encoding="utf-8") as pid_file:
-                pid_data = json.load(pid_file)
-            with open(pid_file_path, "w") as pid_file:
-                pid_data.pop("process_pids", None)
-                json.dump(pid_data, pid_file, indent=4)
-            os._exit(2333333)
+def check_sample_rate(experiment_dir: Path, config: RVCConfig) -> None:
+    first_wav = next((experiment_dir / "sliced_audios").glob("*.wav"), None)
+    if first_wav is None:
+        raise FileNotFoundError(f"No slices in {experiment_dir / 'sliced_audios'}. Run the earlier stages first.")
+    _, sample_rate = load_wav_to_torch(first_wav)
+    if sample_rate != config.data.sample_rate:
+        raise ValueError(
+            f"The model config is for {config.data.sample_rate} Hz, but the slices are at {sample_rate} Hz."
+        )
 
-        with torch.no_grad():
-            torch.cuda.empty_cache()
+
+def speaker_count(experiment_dir: Path, config: RVCConfig) -> int:
+    """Speakers in the dataset, or in the checkpoint being resumed, which wins."""
+    count = read_model_info(experiment_dir).get("speakers_id", config.model.spk_embed_dim)
+    checkpoint_path = latest_checkpoint_path(experiment_dir, "G_*.pth")
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        count = checkpoint["model"]["emb_g.weight"].shape[0]
+    return count
+
+
+def load_pretrained(net_g: Synthesizer, net_d: MultiPeriodDiscriminator, options: TrainingOptions) -> None:
+    """Start from the pretrained base models, keeping the new speaker embedding, which differs in size."""
+    if options.pretrained_g is not None:
+        state = torch.load(options.pretrained_g, map_location="cpu", weights_only=True)["model"]
+        state["emb_g.weight"] = net_g.emb_g.weight.detach().clone()
+        net_g.load_state_dict(state)
+        print(f"Loaded pretrained generator '{options.pretrained_g}'")
+    if options.pretrained_d is not None:
+        net_d.load_state_dict(torch.load(options.pretrained_d, map_location="cpu", weights_only=True)["model"])
+        print(f"Loaded pretrained discriminator '{options.pretrained_d}'")
+
+
+def train(options: TrainingOptions) -> None:
+    experiment_dir = options.experiment_dir
+    config_path = experiment_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"{config_path} not found. Run the extract stage first.")
+    config = RVCConfig.load(config_path)
+    check_sample_rate(experiment_dir, config)
+
+    device = torch.device(options.device)
+    train_dtype = choose_dtype(options.precision, device)
+    if os.name == "nt":
+        torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    else:
+        print("Training on the CPU, which is very slow.")
+    torch.manual_seed(config.train.seed)
+
+    dataset = TextAudioLoaderMultiNSFsid(experiment_dir / "filelist.txt", config.data)
+    sampler = BucketBatchSampler(dataset.lengths, options.batch_size, BUCKET_BOUNDARIES)
+    loader = DataLoader(
+        dataset,
+        num_workers=LOADER_WORKERS,
+        pin_memory=True,
+        collate_fn=collate,
+        batch_sampler=sampler,
+        persistent_workers=True,
+        prefetch_factor=LOADER_PREFETCH,
+    )
+    if len(loader) < MIN_BATCHES:
+        raise ValueError(f"Only {len(loader)} batches of training data. Add more clips or lower the batch size.")
+
+    spk_dim = speaker_count(experiment_dir, config)
+    print(f"Initializing the generator with {spk_dim} speakers.")
+    config = dataclasses.replace(config, model=dataclasses.replace(config.model, spk_embed_dim=spk_dim))
+    net_g = Synthesizer.from_config(
+        config.model, config.data.spec_channels, config.segment_frames, config.data.sample_rate, options.checkpointing
+    ).to(device)
+    net_d = MultiPeriodDiscriminator(config.model.use_spectral_norm, checkpointing=options.checkpointing).to(device)
+    optim_g = torch.optim.AdamW(
+        net_g.parameters(), config.train.learning_rate, betas=config.train.betas, eps=config.train.eps
+    )
+    optim_d = torch.optim.AdamW(
+        net_d.parameters(), config.train.learning_rate, betas=config.train.betas, eps=config.train.eps
+    )
+    print(f"Training in {train_dtype}.")
+
+    state = TrainingState()
+    scaler = torch.amp.GradScaler(enabled=device.type == "cuda" and train_dtype == torch.float16)
+    checkpoint_d = latest_checkpoint_path(experiment_dir, "D_*.pth")
+    checkpoint_g = latest_checkpoint_path(experiment_dir, "G_*.pth")
+    if checkpoint_d is not None and checkpoint_g is not None:
+        _, scaler_state = load_checkpoint(checkpoint_d, net_d, optim_d)
+        last_epoch, _ = load_checkpoint(checkpoint_g, net_g, optim_g)
+        first_epoch = last_epoch + 1
+        state.global_step = last_epoch * len(loader)
+        if scaler_state:
+            scaler.load_state_dict(scaler_state)
+    else:
+        first_epoch = 1
+        load_pretrained(net_g, net_d, options)
+
+    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+        optim_g, gamma=config.train.lr_decay, last_epoch=first_epoch - 2
+    )
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+        optim_d, gamma=config.train.lr_decay, last_epoch=first_epoch - 2
+    )
+
+    # A fixed batch to convert at each save, so the TensorBoard audio shows progress on the same input.
+    reference = next(iter(loader)).to(device)
+    trainer = Trainer(
+        options=options,
+        config=config,
+        device=device,
+        train_dtype=train_dtype,
+        net_g=net_g,
+        net_d=net_d,
+        optim_g=optim_g,
+        optim_d=optim_d,
+        scaler=scaler,
+        loader=loader,
+        sampler=sampler,
+        writer=SummaryWriter(log_dir=str(experiment_dir / "eval")),
+        reference=reference,
+        state=state,
+    )
+    print("Starting training...")
+    for epoch in range(first_epoch, options.total_epochs + 1):
+        trainer.train_epoch(epoch)
+        scheduler_g.step()
+        scheduler_d.step()
+
+    trainer.writer.close()
+    print(
+        f"Training finished at epoch {options.total_epochs}, step {state.global_step}. Lowest generator loss "
+        f"{state.lowest_loss:.3f} at epoch {state.lowest_loss_epoch}, step {state.lowest_loss_step}."
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--experiment-dir", type=Path, required=True)
+    parser.add_argument("--pretrained-g", type=Path, help="Pretrained generator to start from")
+    parser.add_argument("--pretrained-d", type=Path, help="Pretrained discriminator to start from")
+    parser.add_argument("--epochs", type=int, default=TrainingOptions.total_epochs)
+    parser.add_argument("--save-every", type=int, default=TrainingOptions.save_every_epochs)
+    parser.add_argument("--batch-size", type=int, default=TrainingOptions.batch_size)
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=PRECISION)
+    parser.add_argument("--export-final-only", action="store_true", help="Export a voice model only at the end")
+    parser.add_argument("--checkpointing", action="store_true", help="Use less GPU memory, more slowly")
+    args = parser.parse_args(argv)
+    options = TrainingOptions(
+        experiment_dir=args.experiment_dir.resolve(),
+        pretrained_g=args.pretrained_g,
+        pretrained_d=args.pretrained_d,
+        total_epochs=args.epochs,
+        save_every_epochs=args.save_every,
+        batch_size=args.batch_size,
+        device=args.device,
+        precision=args.precision,
+        export_every_save=not args.export_final_only,
+        checkpointing=args.checkpointing,
+    )
+    try:
+        train(options)
+    except (FileNotFoundError, ValueError) as error:
+        sys.exit(f"Training failed: {error}")
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.set_start_method("spawn")
     main()

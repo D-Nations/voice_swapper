@@ -40,9 +40,8 @@ package = false
 
 [tool.ruff]
 line-length = 120
-# Third-party code: the Applio submodule, and the Applio files copied into rvc/ unchanged except for
-# targeted patches. Keeping them unformatted keeps them easy to compare with upstream.
-extend-exclude = ["third_party", "rvc/configs", "rvc/lib", "rvc/train"]
+# The Applio submodule, kept for reference.
+extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
 ignore = []
@@ -53,7 +52,7 @@ pythonpath = ["."]
 markers = []
 
 [tool.ty.src]
-exclude = ["third_party", "rvc/configs", "rvc/lib", "rvc/train"]
+exclude = ["third_party"]
 
 [tool.pyright]
 # Point Pylance and Pyright at the uv-managed virtual environment.
@@ -61,7 +60,7 @@ venvPath = "."
 venv = ".venv"
 # Resolve imports like cycle_gan.config from the project root.
 extraPaths = ["."]
-exclude = ["third_party", ".venv", "rvc/configs", "rvc/lib", "rvc/train"]
+exclude = ["third_party", ".venv"]
 
 # Only torch and torchaudio come from the PyTorch index. Everything else uses PyPI.
 [tool.uv.sources]

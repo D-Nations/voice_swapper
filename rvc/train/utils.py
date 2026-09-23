@@ -1,253 +1,125 @@
-import os
-import glob
-import torch
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import matplotlib
 import numpy as np
 import soundfile as sf
-from collections import OrderedDict
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-MATPLOTLIB_FLAG = False
+# Weight norm parameter names in torch's parametrizations API, and in the older API that saved
+# checkpoints and exported models use, which keeps them loadable by other RVC tools.
+PARAMETRIZED_NAMES = (".parametrizations.weight.original0", ".parametrizations.weight.original1")
+LEGACY_NAMES = (".weight_g", ".weight_v")
 
 
-def replace_keys_in_dict(d, old_key_part, new_key_part):
-    """
-    Recursively replace parts of the keys in a dictionary.
-
-    Args:
-        d (dict or OrderedDict): The dictionary to update.
-        old_key_part (str): The part of the key to replace.
-        new_key_part (str): The new part of the key.
-    """
-    updated_dict = OrderedDict() if isinstance(d, OrderedDict) else {}
-    for key, value in d.items():
-        new_key = (
-            key.replace(old_key_part, new_key_part) if isinstance(key, str) else key
+def replace_keys_in_dict(d: Mapping[Any, Any], old_key_part: str, new_key_part: str) -> dict[Any, Any]:
+    """Replace old_key_part with new_key_part in every string key, recursing into nested dicts."""
+    return {
+        (key.replace(old_key_part, new_key_part) if isinstance(key, str) else key): (
+            replace_keys_in_dict(value, old_key_part, new_key_part) if isinstance(value, dict) else value
         )
-        updated_dict[new_key] = (
-            replace_keys_in_dict(value, old_key_part, new_key_part)
-            if isinstance(value, dict)
-            else value
-        )
-    return updated_dict
-
-
-def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
-    """
-    Load a checkpoint into a model and optionally the optimizer.
-
-    Args:
-        checkpoint_path (str): Path to the checkpoint file.
-        model (torch.nn.Module): The model to load the checkpoint into.
-        optimizer (torch.optim.Optimizer, optional): The optimizer to load the state from. Defaults to None.
-        load_opt (int, optional): Whether to load the optimizer state. Defaults to 1.
-    """
-    assert os.path.isfile(
-        checkpoint_path
-    ), f"Checkpoint file not found: {checkpoint_path}"
-
-    checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    checkpoint_dict = replace_keys_in_dict(
-        replace_keys_in_dict(
-            checkpoint_dict, ".weight_v", ".parametrizations.weight.original1"
-        ),
-        ".weight_g",
-        ".parametrizations.weight.original0",
-    )
-
-    # Update model state_dict
-    model_state_dict = (
-        model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-    )
-    new_state_dict = {
-        k: checkpoint_dict["model"].get(k, v) for k, v in model_state_dict.items()
+        for key, value in d.items()
     }
 
-    # Load state_dict into model
-    if hasattr(model, "module"):
-        model.module.load_state_dict(new_state_dict, strict=False)
-    else:
-        model.load_state_dict(new_state_dict, strict=False)
 
-    if optimizer and load_opt == 1:
-        optimizer.load_state_dict(checkpoint_dict.get("optimizer", {}))
+def to_legacy_names(d: Mapping[Any, Any]) -> dict[Any, Any]:
+    for new, old in zip(PARAMETRIZED_NAMES, LEGACY_NAMES, strict=True):
+        d = replace_keys_in_dict(d, new, old)
+    return dict(d)
 
-    print(
-        f"Loaded checkpoint '{checkpoint_path}' (epoch {checkpoint_dict['iteration']})"
-    )
-    return (
-        model,
-        optimizer,
-        checkpoint_dict.get("learning_rate", 0),
-        checkpoint_dict["iteration"],
-        checkpoint_dict.get("scaler", {}),
-    )
+
+def from_legacy_names(d: Mapping[Any, Any]) -> dict[Any, Any]:
+    for new, old in zip(PARAMETRIZED_NAMES, LEGACY_NAMES, strict=True):
+        d = replace_keys_in_dict(d, old, new)
+    return dict(d)
+
+
+def load_checkpoint(
+    checkpoint_path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer | None = None
+) -> tuple[int, dict[str, Any]]:
+    """Load a training checkpoint into model and, if given, optimizer.
+
+    Returns the epoch the checkpoint was saved at and the gradient scaler's state.
+    """
+    checkpoint = from_legacy_names(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+    # Keep the model's own values for any keys the checkpoint lacks.
+    state = {key: checkpoint["model"].get(key, value) for key, value in model.state_dict().items()}
+    model.load_state_dict(state, strict=False)
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint.get("optimizer", {}))
+    print(f"Loaded checkpoint '{checkpoint_path}' (epoch {checkpoint['iteration']})")
+    return checkpoint["iteration"], checkpoint.get("scaler", {})
 
 
 def save_checkpoint(
-    model, optimizer, learning_rate, iteration, checkpoint_path, scaler
-):
-    """
-    Save the model and optimizer state to a checkpoint file.
-
-    Args:
-        model (torch.nn.Module): The model to save.
-        optimizer (torch.optim.Optimizer): The optimizer to save the state of.
-        learning_rate (float): The current learning rate.
-        iteration (int): The current iteration.
-        checkpoint_path (str): The path to save the checkpoint to.
-    """
-    state_dict = (
-        model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-    )
-    checkpoint_data = {
-        "model": state_dict,
-        "iteration": iteration,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    learning_rate: float,
+    epoch: int,
+    checkpoint_path: Path,
+    scaler: torch.amp.GradScaler,
+) -> None:
+    checkpoint = {
+        "model": model.state_dict(),
+        "iteration": epoch,
         "optimizer": optimizer.state_dict(),
         "learning_rate": learning_rate,
         "scaler": scaler.state_dict(),
     }
-
-    # Create a backwards-compatible checkpoint
-    torch.save(
-        replace_keys_in_dict(
-            replace_keys_in_dict(
-                checkpoint_data, ".parametrizations.weight.original1", ".weight_v"
-            ),
-            ".parametrizations.weight.original0",
-            ".weight_g",
-        ),
-        checkpoint_path,
-    )
-
-    print(f"Saved model '{checkpoint_path}' (epoch {iteration})")
+    torch.save(to_legacy_names(checkpoint), checkpoint_path)
+    print(f"Saved checkpoint '{checkpoint_path}' (epoch {epoch})")
 
 
-def summarize(
-    writer,
-    global_step,
-    scalars={},
-    histograms={},
-    images={},
-    audios={},
-    audio_sample_rate=22050,
-):
-    """
-    Log various summaries to a TensorBoard writer.
-
-    Args:
-        writer (SummaryWriter): The TensorBoard writer.
-        global_step (int): The current global step.
-        scalars (dict, optional): Dictionary of scalar values to log.
-        histograms (dict, optional): Dictionary of histogram values to log.
-        images (dict, optional): Dictionary of image values to log.
-        audios (dict, optional): Dictionary of audio values to log.
-        audio_sample_rate (int, optional): Sampling rate of the audio data.
-    """
-    for k, v in scalars.items():
-        writer.add_scalar(k, v, global_step)
-    for k, v in histograms.items():
-        writer.add_histogram(k, v, global_step)
-    for k, v in images.items():
-        writer.add_image(k, v, global_step, dataformats="HWC")
-    for k, v in audios.items():
-        writer.add_audio(k, v, global_step, audio_sample_rate)
-
-
-def latest_checkpoint_path(dir_path, regex="G_*.pth"):
-    """
-    Get the latest checkpoint file in a directory.
-
-    Args:
-        dir_path (str): The directory to search for checkpoints.
-        regex (str, optional): The regular expression to match checkpoint files.
-    """
-    checkpoints = sorted(
-        glob.glob(os.path.join(dir_path, regex)),
-        key=lambda f: int("".join(filter(str.isdigit, f))),
-    )
+def latest_checkpoint_path(directory: Path, pattern: str) -> Path | None:
+    """The most recently written file in directory matching pattern, such as "G_*.pth"."""
+    checkpoints = sorted(directory.glob(pattern), key=lambda path: path.stat().st_mtime)
     return checkpoints[-1] if checkpoints else None
 
 
-def plot_spectrogram_to_numpy(spectrogram):
-    """
-    Convert a spectrogram to a NumPy array for visualization.
+def summarize(
+    writer: SummaryWriter,
+    global_step: int,
+    scalars: Mapping[str, float | torch.Tensor] | None = None,
+    images: Mapping[str, np.ndarray] | None = None,
+    audios: Mapping[str, torch.Tensor] | None = None,
+    audio_sample_rate: int = 22050,
+) -> None:
+    """Log scalars, HWC images, and audio clips to TensorBoard."""
+    for key, value in (scalars or {}).items():
+        writer.add_scalar(key, value, global_step)
+    for key, value in (images or {}).items():
+        writer.add_image(key, value, global_step, dataformats="HWC")
+    for key, value in (audios or {}).items():
+        writer.add_audio(key, value, global_step, audio_sample_rate)
 
-    Args:
-        spectrogram (numpy.ndarray): The spectrogram to plot.
-    """
-    global MATPLOTLIB_FLAG
-    if not MATPLOTLIB_FLAG:
-        plt.switch_backend("Agg")
-        MATPLOTLIB_FLAG = True
 
+def plot_spectrogram_to_numpy(spectrogram: np.ndarray) -> np.ndarray:
+    """Render a spectrogram as an RGB image array."""
     fig, ax = plt.subplots(figsize=(10, 2))
     im = ax.imshow(spectrogram, aspect="auto", origin="lower", interpolation="none")
-    plt.colorbar(im, ax=ax)
-    plt.xlabel("Frames")
-    plt.ylabel("Channels")
-    plt.tight_layout()
-
-    fig.canvas.draw()
-    buf = fig.canvas.renderer.buffer_rgba()
-    w, h = fig.canvas.get_width_height()
-    data = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)[..., :3]
-
+    fig.colorbar(im, ax=ax)
+    ax.set_xlabel("Frames")
+    ax.set_ylabel("Channels")
+    fig.tight_layout()
+    canvas = fig.canvas
+    assert isinstance(canvas, FigureCanvasAgg)
+    canvas.draw()
+    data = np.asarray(canvas.buffer_rgba())[..., :3].copy()
     plt.close(fig)
     return data
 
 
-def load_wav_to_torch(full_path):
-    """
-    Load a WAV file into a PyTorch tensor.
-
-    Args:
-        full_path (str): The path to the WAV file.
-    """
-    data, sample_rate = sf.read(full_path, dtype="float32")
-    return torch.FloatTensor(data), sample_rate
+def load_wav_to_torch(path: str | Path) -> tuple[torch.Tensor, int]:
+    data, sample_rate = sf.read(path, dtype="float32")
+    return torch.from_numpy(data), sample_rate
 
 
-def load_filepaths_and_text(filename, split="|"):
-    """
-    Load filepaths and associated text from a file.
-
-    Args:
-        filename (str): The path to the file.
-        split (str, optional): The delimiter used to split the lines.
-    """
-    with open(filename, encoding="utf-8") as f:
-        return [line.strip().split(split) for line in f]
-
-
-class HParams:
-    """
-    A class for storing and accessing hyperparameters.
-    """
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            self[k] = HParams(**v) if isinstance(v, dict) else v
-
-    def keys(self):
-        return self.__dict__.keys()
-
-    def items(self):
-        return self.__dict__.items()
-
-    def values(self):
-        return self.__dict__.values()
-
-    def __len__(self):
-        return len(self.__dict__)
-
-    def __getitem__(self, key):
-        return self.__dict__[key]
-
-    def __setitem__(self, key, value):
-        self.__dict__[key] = value
-
-    def __contains__(self, key):
-        return key in self.__dict__
-
-    def __repr__(self):
-        return repr(self.__dict__)
+def load_filelist(path: Path, split: str = "|") -> list[list[str]]:
+    with open(path, encoding="utf-8") as file:
+        return [line.strip().split(split) for line in file]

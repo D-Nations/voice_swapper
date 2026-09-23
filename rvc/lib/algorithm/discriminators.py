@@ -1,55 +1,41 @@
 import torch
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+from torch.nn import functional as F
 from torch.nn.utils.parametrizations import spectral_norm, weight_norm
+from torch.utils.checkpoint import checkpoint
 
 from rvc.lib.algorithm.commons import get_padding
 from rvc.lib.algorithm.residuals import LRELU_SLOPE
 
+# RVC v2's periods. The pretrained discriminators expect exactly these.
+PERIODS = (2, 3, 5, 7, 11, 17, 23, 37)
+
+type FeatureMaps = list[torch.Tensor]
+
 
 class MultiPeriodDiscriminator(torch.nn.Module):
-    """
-    Multi-period discriminator.
-
-    This class implements a multi-period discriminator, which is used to
-    discriminate between real and fake audio signals. The discriminator
-    is composed of a series of convolutional layers that are applied to
-    the input signal at different periods.
+    """A scale discriminator plus one period discriminator per entry of PERIODS.
 
     Args:
-        use_spectral_norm (bool): Whether to use spectral normalization.
-            Defaults to False.
+        use_spectral_norm: Use spectral instead of weight normalization.
+        checkpointing: Recompute activations in the backward pass to save memory.
     """
 
-    def __init__(
-        self,
-        use_spectral_norm: bool = False,
-        checkpointing: bool = False,
-        version: str = "v2",
-    ):
+    def __init__(self, use_spectral_norm: bool = False, checkpointing: bool = False) -> None:
         super().__init__()
-
-        if version == "v1":
-            periods = [2, 3, 5, 7, 11, 17]
-            resolutions = []
-        elif version == "v2":
-            periods = [2, 3, 5, 7, 11, 17, 23, 37]
-            resolutions = []
-        elif version == "v3":
-            periods = [2, 3, 5, 7, 11]
-            resolutions = [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]]
-
         self.checkpointing = checkpointing
         self.discriminators = torch.nn.ModuleList(
             [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
-            + [DiscriminatorP(p, use_spectral_norm=use_spectral_norm) for p in periods]
-            + [
-                DiscriminatorR(r, use_spectral_norm=use_spectral_norm)
-                for r in resolutions
-            ]
+            + [DiscriminatorP(p, use_spectral_norm=use_spectral_norm) for p in PERIODS]
         )
 
-    def forward(self, y, y_hat):
+    def forward(
+        self, y: torch.Tensor, y_hat: torch.Tensor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[FeatureMaps], list[FeatureMaps]]:
+        """Score real audio y and generated audio y_hat with every discriminator.
+
+        Returns the scores for real audio, the scores for generated audio, and the feature maps
+        of each, one entry per discriminator.
+        """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
         for d in self.discriminators:
             if self.training and self.checkpointing:
@@ -62,22 +48,14 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             y_d_gs.append(y_d_g)
             fmap_rs.append(fmap_r)
             fmap_gs.append(fmap_g)
-
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
 class DiscriminatorS(torch.nn.Module):
-    """
-    Discriminator for the short-term component.
+    """Discriminator over the raw waveform, with strided grouped convolutions."""
 
-    This class implements a discriminator for the short-term component
-    of the audio signal. The discriminator is composed of a series of
-    convolutional layers that are applied to the input signal.
-    """
-
-    def __init__(self, use_spectral_norm: bool = False):
+    def __init__(self, use_spectral_norm: bool = False) -> None:
         super().__init__()
-
         norm_f = spectral_norm if use_spectral_norm else weight_norm
         self.convs = torch.nn.ModuleList(
             [
@@ -92,171 +70,52 @@ class DiscriminatorS(torch.nn.Module):
         self.conv_post = norm_f(torch.nn.Conv1d(1024, 1, 3, 1, padding=1))
         self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, FeatureMaps]:
         fmap = []
         for conv in self.convs:
             x = self.lrelu(conv(x))
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-        return x, fmap
+        return torch.flatten(x, 1, -1), fmap
 
 
 class DiscriminatorP(torch.nn.Module):
-    """
-    Discriminator for the long-term component.
-
-    This class implements a discriminator for the long-term component
-    of the audio signal. The discriminator is composed of a series of
-    convolutional layers that are applied to the input signal at a given
-    period.
+    """Discriminator over the waveform folded into rows of `period` samples, so it sees periodic structure.
 
     Args:
-        period (int): Period of the discriminator.
-        kernel_size (int): Kernel size of the convolutional layers. Defaults to 5.
-        stride (int): Stride of the convolutional layers. Defaults to 3.
-        use_spectral_norm (bool): Whether to use spectral normalization. Defaults to False.
+        period: Samples per row.
+        kernel_size: Kernel height of the convolutions.
+        use_spectral_norm: Use spectral instead of weight normalization.
     """
 
-    def __init__(
-        self,
-        period: int,
-        kernel_size: int = 5,
-        stride: int = 3,
-        use_spectral_norm: bool = False,
-    ):
+    def __init__(self, period: int, kernel_size: int = 5, use_spectral_norm: bool = False) -> None:
         super().__init__()
         self.period = period
         norm_f = spectral_norm if use_spectral_norm else weight_norm
-
         in_channels = [1, 32, 128, 512, 1024]
         out_channels = [32, 128, 512, 1024, 1024]
         strides = [3, 3, 3, 3, 1]
-
         self.convs = torch.nn.ModuleList(
             [
                 norm_f(
-                    torch.nn.Conv2d(
-                        in_ch,
-                        out_ch,
-                        (kernel_size, 1),
-                        (s, 1),
-                        padding=(get_padding(kernel_size, 1), 0),
-                    )
+                    torch.nn.Conv2d(in_ch, out_ch, (kernel_size, 1), (s, 1), padding=(get_padding(kernel_size, 1), 0))
                 )
-                for in_ch, out_ch, s in zip(in_channels, out_channels, strides)
+                for in_ch, out_ch, s in zip(in_channels, out_channels, strides, strict=True)
             ]
         )
-
         self.conv_post = norm_f(torch.nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
         self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, FeatureMaps]:
         fmap = []
         b, c, t = x.shape
         if t % self.period != 0:
-            n_pad = self.period - (t % self.period)
-            x = torch.nn.functional.pad(x, (0, n_pad), "reflect")
+            x = F.pad(x, (0, self.period - (t % self.period)), "reflect")
         x = x.view(b, c, -1, self.period)
-
         for conv in self.convs:
             x = self.lrelu(conv(x))
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-        return x, fmap
-
-
-class DiscriminatorR(torch.nn.Module):
-    def __init__(self, resolution, use_spectral_norm=False):
-        super().__init__()
-
-        self.resolution = resolution
-        self.lrelu_slope = 0.1
-        norm_f = spectral_norm if use_spectral_norm else weight_norm
-
-        self.convs = torch.nn.ModuleList(
-            [
-                norm_f(
-                    torch.nn.Conv2d(
-                        1,
-                        32,
-                        (3, 9),
-                        padding=(1, 4),
-                    )
-                ),
-                norm_f(
-                    torch.nn.Conv2d(
-                        32,
-                        32,
-                        (3, 9),
-                        stride=(1, 2),
-                        padding=(1, 4),
-                    )
-                ),
-                norm_f(
-                    torch.nn.Conv2d(
-                        32,
-                        32,
-                        (3, 9),
-                        stride=(1, 2),
-                        padding=(1, 4),
-                    )
-                ),
-                norm_f(
-                    torch.nn.Conv2d(
-                        32,
-                        32,
-                        (3, 9),
-                        stride=(1, 2),
-                        padding=(1, 4),
-                    )
-                ),
-                norm_f(
-                    torch.nn.Conv2d(
-                        32,
-                        32,
-                        (3, 3),
-                        padding=(1, 1),
-                    )
-                ),
-            ]
-        )
-        self.conv_post = norm_f(torch.nn.Conv2d(32, 1, (3, 3), padding=(1, 1)))
-
-    def forward(self, x):
-        fmap = []
-
-        x = self.spectrogram(x).unsqueeze(1)
-
-        for layer in self.convs:
-            x = F.leaky_relu(layer(x), self.lrelu_slope)
-            fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-
         return torch.flatten(x, 1, -1), fmap
-
-    def spectrogram(self, x):
-        n_fft, hop_length, win_length = self.resolution
-        pad = int((n_fft - hop_length) / 2)
-        x = F.pad(
-            x,
-            (pad, pad),
-            mode="reflect",
-        ).squeeze(1)
-        x = torch.stft(
-            x,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=torch.ones(win_length, device=x.device),
-            center=False,
-            return_complex=True,
-        )
-
-        mag = torch.norm(torch.view_as_real(x), p=2, dim=-1)  # [B, F, TT]
-
-        return mag

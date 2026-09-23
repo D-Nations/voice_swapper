@@ -1,362 +1,190 @@
 import os
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import NamedTuple
+
 import numpy as np
 import torch
 import torch.utils.data
 
+from rvc.configs.config import DataConfig
 from rvc.train.mel_processing import spectrogram_torch
-from rvc.train.utils import load_filepaths_and_text, load_wav_to_torch
+from rvc.train.utils import load_filelist, load_wav_to_torch
+
+MAX_FRAMES = 900  # Longest slice used, in pitch frames (10 ms each at 40 kHz).
+
+type Sample = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
-class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
-    """
-    Dataset that loads text and audio pairs.
+class TrainingBatch(NamedTuple):
+    phone: torch.Tensor  # Content features, [batch, frames, 768]
+    phone_lengths: torch.Tensor
+    pitch: torch.Tensor  # Coarse pitch bins, [batch, frames]
+    pitchf: torch.Tensor  # Pitch in Hz, [batch, frames]
+    spec: torch.Tensor  # Linear spectrogram, [batch, bins, frames]
+    spec_lengths: torch.Tensor
+    wave: torch.Tensor  # Audio, [batch, 1, samples]
+    wave_lengths: torch.Tensor
+    sid: torch.Tensor  # Speaker ids, [batch]
 
-    Args:
-        hparams: Hyperparameters.
-    """
-
-    def __init__(self, hparams):
-        self.audiopaths_and_text = load_filepaths_and_text(hparams.training_files)
-        self.max_wav_value = hparams.max_wav_value
-        self.sample_rate = hparams.sample_rate
-        self.filter_length = hparams.filter_length
-        self.hop_length = hparams.hop_length
-        self.win_length = hparams.win_length
-        self.sample_rate = hparams.sample_rate
-        self.min_text_len = getattr(hparams, "min_text_len", 1)
-        self.max_text_len = getattr(hparams, "max_text_len", 5000)
-        self._filter()
-
-    def _filter(self):
-        """
-        Filters audio paths and text pairs based on text length.
-        """
-        audiopaths_and_text_new = []
-        lengths = []
-        for audiopath, text, pitch, pitchf, dv in self.audiopaths_and_text:
-            if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
-                audiopaths_and_text_new.append([audiopath, text, pitch, pitchf, dv])
-                lengths.append(os.path.getsize(audiopath) // (3 * self.hop_length))
-        self.audiopaths_and_text = audiopaths_and_text_new
-        self.lengths = lengths
-
-    def get_sid(self, sid):
-        """
-        Converts speaker ID to a LongTensor.
-
-        Args:
-            sid (str): Speaker ID.
-        """
-        try:
-            sid = torch.LongTensor([int(sid)])
-        except ValueError as error:
-            print(f"Error converting speaker ID '{sid}' to integer. Exception: {error}")
-            sid = torch.LongTensor([0])
-        return sid
-
-    def get_audio_text_pair(self, audiopath_and_text):
-        """
-        Loads and processes audio and text data for a single pair.
-
-        Args:
-            audiopath_and_text (list): List containing audio path, text, pitch, pitchf, and speaker ID.
-        """
-        file = audiopath_and_text[0]
-        phone = audiopath_and_text[1]
-        pitch = audiopath_and_text[2]
-        pitchf = audiopath_and_text[3]
-        dv = audiopath_and_text[4]
-
-        phone, pitch, pitchf = self.get_labels(phone, pitch, pitchf)
-        spec, wav = self.get_audio(file)
-        dv = self.get_sid(dv)
-
-        len_phone = phone.size()[0]
-        len_spec = spec.size()[-1]
-        if len_phone != len_spec:
-            len_min = min(len_phone, len_spec)
-            len_wav = len_min * self.hop_length
-
-            spec = spec[:, :len_min]
-            wav = wav[:, :len_wav]
-
-            phone = phone[:len_min, :]
-            pitch = pitch[:len_min]
-            pitchf = pitchf[:len_min]
-
-        return (spec, wav, phone, pitch, pitchf, dv)
-
-    def get_labels(self, phone, pitch, pitchf):
-        """
-        Loads and processes phoneme, pitch, and pitchf labels.
-
-        Args:
-            phone (str): Path to phoneme label file.
-            pitch (str): Path to pitch label file.
-            pitchf (str): Path to pitchf label file.
-        """
-        phone = np.load(phone)
-        phone = np.repeat(phone, 2, axis=0)
-        pitch = np.load(pitch)
-        pitchf = np.load(pitchf)
-        n_num = min(phone.shape[0], 900)
-        phone = phone[:n_num, :]
-        pitch = pitch[:n_num]
-        pitchf = pitchf[:n_num]
-        phone = torch.FloatTensor(phone)
-        pitch = torch.LongTensor(pitch)
-        pitchf = torch.FloatTensor(pitchf)
-        return phone, pitch, pitchf
-
-    def get_audio(self, filename):
-        """
-        Loads and processes audio data.
-
-        Args:
-            filename (str): Path to audio file.
-        """
-        audio, sample_rate = load_wav_to_torch(filename)
-        if sample_rate != self.sample_rate:
-            raise ValueError(
-                f"{sample_rate} SR doesn't match target {self.sample_rate} SR"
-            )
-        audio_norm = audio
-        audio_norm = audio_norm.unsqueeze(0)
-        spec = spectrogram_torch(
-            audio_norm,
-            self.filter_length,
-            self.hop_length,
-            self.win_length,
-            center=False,
-        )
-        spec = torch.squeeze(spec, 0)
-        return spec, audio_norm
-
-    def __getitem__(self, index):
-        """
-        Returns a single audio-text pair.
-
-        Args:
-            index (int): Index of the data sample.
-        """
-        return self.get_audio_text_pair(self.audiopaths_and_text[index])
-
-    def __len__(self):
-        """
-        Returns the length of the dataset.
-        """
-        return len(self.audiopaths_and_text)
+    def to(self, device: torch.device | str, non_blocking: bool = False) -> TrainingBatch:
+        return TrainingBatch(*(tensor.to(device, non_blocking=non_blocking) for tensor in self))
 
 
-class TextAudioCollateMultiNSFsid:
-    """
-    Collates text and audio data for training.
+class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset[Sample]):
+    """Training slices from filelist.txt, each as (spec, wave, phone, pitch, pitchf, speaker id).
 
-    Args:
-        return_ids (bool, optional): Whether to return sample IDs. Defaults to False.
+    Content features come at half the spectrogram's frame rate, so they are repeated to match,
+    and every item is trimmed to its shortest stream.
     """
 
-    def __init__(self, return_ids=False):
-        self.return_ids = return_ids
+    def __init__(self, filelist: Path, data: DataConfig) -> None:
+        self.entries = load_filelist(filelist)
+        self.sample_rate = data.sample_rate
+        self.filter_length = data.filter_length
+        self.hop_length = data.hop_length
+        self.win_length = data.win_length
+        # Approximate lengths for bucketing, from the file size: 4-byte samples, so size // (3 * hop) is a
+        # slight overestimate of the frame count.
+        self.lengths = [os.path.getsize(entry[0]) // (3 * self.hop_length) for entry in self.entries]
 
-    def __call__(self, batch):
-        """
-        Collates a batch of data samples.
+    def __getitem__(self, index: int) -> Sample:
+        wav_path, phone_path, pitch_path, pitchf_path, speaker = self.entries[index]
+        phone, pitch, pitchf = self.get_labels(phone_path, pitch_path, pitchf_path)
+        spec, wav = self.get_audio(wav_path)
+        sid = torch.LongTensor([int(speaker)])
 
-        Args:
-            batch (list): List of data samples.
-        """
-        _, ids_sorted_decreasing = torch.sort(
-            torch.LongTensor([x[0].size(1) for x in batch]), dim=0, descending=True
-        )
+        len_min = min(phone.size(0), spec.size(-1))
+        spec = spec[:, :len_min]
+        wav = wav[:, : len_min * self.hop_length]
+        phone = phone[:len_min, :]
+        pitch = pitch[:len_min]
+        pitchf = pitchf[:len_min]
+        return spec, wav, phone, pitch, pitchf, sid
 
-        max_spec_len = max([x[0].size(1) for x in batch])
-        max_wave_len = max([x[1].size(1) for x in batch])
-        spec_lengths = torch.LongTensor(len(batch))
-        wave_lengths = torch.LongTensor(len(batch))
-        spec_padded = torch.FloatTensor(len(batch), batch[0][0].size(0), max_spec_len)
-        wave_padded = torch.FloatTensor(len(batch), 1, max_wave_len)
-        spec_padded.zero_()
-        wave_padded.zero_()
+    def __len__(self) -> int:
+        return len(self.entries)
 
-        max_phone_len = max([x[2].size(0) for x in batch])
-        phone_lengths = torch.LongTensor(len(batch))
-        phone_padded = torch.FloatTensor(
-            len(batch), max_phone_len, batch[0][2].shape[1]
-        )
-        pitch_padded = torch.LongTensor(len(batch), max_phone_len)
-        pitchf_padded = torch.FloatTensor(len(batch), max_phone_len)
-        phone_padded.zero_()
-        pitch_padded.zero_()
-        pitchf_padded.zero_()
-        sid = torch.LongTensor(len(batch))
-
-        for i in range(len(ids_sorted_decreasing)):
-            row = batch[ids_sorted_decreasing[i]]
-
-            spec = row[0]
-            spec_padded[i, :, : spec.size(1)] = spec
-            spec_lengths[i] = spec.size(1)
-
-            wave = row[1]
-            wave_padded[i, :, : wave.size(1)] = wave
-            wave_lengths[i] = wave.size(1)
-
-            phone = row[2]
-            phone_padded[i, : phone.size(0), :] = phone
-            phone_lengths[i] = phone.size(0)
-
-            pitch = row[3]
-            pitch_padded[i, : pitch.size(0)] = pitch
-            pitchf = row[4]
-            pitchf_padded[i, : pitchf.size(0)] = pitchf
-
-            sid[i] = row[5]
-
+    @staticmethod
+    def get_labels(
+        phone_path: str, pitch_path: str, pitchf_path: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        phone = np.repeat(np.load(phone_path), 2, axis=0)
+        pitch = np.load(pitch_path)
+        pitchf = np.load(pitchf_path)
+        n_num = min(phone.shape[0], MAX_FRAMES)
         return (
-            phone_padded,
-            phone_lengths,
-            pitch_padded,
-            pitchf_padded,
-            spec_padded,
-            spec_lengths,
-            wave_padded,
-            wave_lengths,
-            sid,
+            torch.FloatTensor(phone[:n_num, :]),
+            torch.LongTensor(pitch[:n_num]),
+            torch.FloatTensor(pitchf[:n_num]),
         )
 
+    def get_audio(self, path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        audio, sample_rate = load_wav_to_torch(path)
+        if sample_rate != self.sample_rate:
+            raise ValueError(f"{path} is at {sample_rate} Hz, not the model's {self.sample_rate} Hz.")
+        audio = audio.unsqueeze(0)
+        spec = spectrogram_torch(audio, self.filter_length, self.hop_length, self.win_length, center=False)
+        return spec.squeeze(0), audio
 
-class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
-    """
-    Distributed sampler that groups data into buckets based on length.
+
+def collate(batch: Sequence[Sample]) -> TrainingBatch:
+    """Zero-pad a batch to its longest item, ordered from longest to shortest spectrogram."""
+    _, order = torch.sort(torch.LongTensor([item[0].size(1) for item in batch]), dim=0, descending=True)
+    size = len(batch)
+    max_spec_len = max(item[0].size(1) for item in batch)
+    max_wave_len = max(item[1].size(1) for item in batch)
+    max_phone_len = max(item[2].size(0) for item in batch)
+
+    spec_padded = torch.zeros(size, batch[0][0].size(0), max_spec_len)
+    wave_padded = torch.zeros(size, 1, max_wave_len)
+    phone_padded = torch.zeros(size, max_phone_len, batch[0][2].shape[1])
+    pitch_padded = torch.zeros(size, max_phone_len, dtype=torch.long)
+    pitchf_padded = torch.zeros(size, max_phone_len)
+    spec_lengths = torch.zeros(size, dtype=torch.long)
+    wave_lengths = torch.zeros(size, dtype=torch.long)
+    phone_lengths = torch.zeros(size, dtype=torch.long)
+    sid = torch.zeros(size, dtype=torch.long)
+
+    for i, index in enumerate(order.tolist()):
+        spec, wave, phone, pitch, pitchf, speaker = batch[index]
+        spec_padded[i, :, : spec.size(1)] = spec
+        spec_lengths[i] = spec.size(1)
+        wave_padded[i, :, : wave.size(1)] = wave
+        wave_lengths[i] = wave.size(1)
+        phone_padded[i, : phone.size(0), :] = phone
+        phone_lengths[i] = phone.size(0)
+        pitch_padded[i, : pitch.size(0)] = pitch
+        pitchf_padded[i, : pitchf.size(0)] = pitchf
+        sid[i] = speaker
+
+    return TrainingBatch(
+        phone_padded,
+        phone_lengths,
+        pitch_padded,
+        pitchf_padded,
+        spec_padded,
+        spec_lengths,
+        wave_padded,
+        wave_lengths,
+        sid,
+    )
+
+
+class BucketBatchSampler(torch.utils.data.Sampler[list[int]]):
+    """Batches of similar-length items, so little of each batch is padding.
+
+    Items are grouped into buckets by length between consecutive boundaries, and items outside
+    all buckets are dropped. Each bucket is padded with repeats to a whole number of batches.
+    Call set_epoch before each epoch so the shuffle changes between epochs but not between runs.
 
     Args:
-        dataset (torch.utils.data.Dataset): Dataset to sample from.
-        batch_size (int): Batch size.
-        boundaries (list): List of length boundaries for buckets.
-        num_replicas (int, optional): Number of processes participating in distributed training. Defaults to None.
-        rank (int, optional): Rank of the current process. Defaults to None.
-        shuffle (bool, optional): Whether to shuffle the data. Defaults to True.
+        lengths: Length of each item.
+        batch_size: Items per batch.
+        boundaries: Increasing bucket edges. Bucket i holds lengths in (boundaries[i], boundaries[i + 1]].
+        shuffle: Shuffle within buckets and the order of batches.
     """
 
     def __init__(
-        self,
-        dataset,
-        batch_size,
-        boundaries,
-        num_replicas=None,
-        rank=None,
-        shuffle=True,
-    ):
-        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
-        self.lengths = dataset.lengths
+        self, lengths: Sequence[int], batch_size: int, boundaries: Sequence[int], shuffle: bool = True
+    ) -> None:
         self.batch_size = batch_size
-        self.boundaries = boundaries
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.buckets = self._create_buckets(lengths, list(boundaries))
+        self.num_samples_per_bucket = [
+            len(bucket) + (batch_size - len(bucket) % batch_size) % batch_size for bucket in self.buckets
+        ]
+        self.num_samples = sum(self.num_samples_per_bucket)
 
-        self.buckets, self.num_samples_per_bucket = self._create_buckets()
-        self.total_size = sum(self.num_samples_per_bucket)
-        self.num_samples = self.total_size // self.num_replicas
+    @staticmethod
+    def _create_buckets(lengths: Sequence[int], boundaries: list[int]) -> list[list[int]]:
+        buckets: list[list[int]] = [[] for _ in range(len(boundaries) - 1)]
+        for index, length in enumerate(lengths):
+            for b in range(len(boundaries) - 1):
+                if boundaries[b] < length <= boundaries[b + 1]:
+                    buckets[b].append(index)
+                    break
+        return [bucket for bucket in buckets if bucket]
 
-    def _create_buckets(self):
-        """
-        Creates buckets of data samples based on length.
-        """
-        buckets = [[] for _ in range(len(self.boundaries) - 1)]
-        for i in range(len(self.lengths)):
-            length = self.lengths[i]
-            idx_bucket = self._bisect(length)
-            if idx_bucket != -1:
-                buckets[idx_bucket].append(i)
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
-        for i in range(len(buckets) - 1, -1, -1):  #
-            if len(buckets[i]) == 0:
-                buckets.pop(i)
-                self.boundaries.pop(i + 1)
-
-        num_samples_per_bucket = []
-        for i in range(len(buckets)):
-            len_bucket = len(buckets[i])
-            total_batch_size = self.num_replicas * self.batch_size
-            rem = (
-                total_batch_size - (len_bucket % total_batch_size)
-            ) % total_batch_size
-            num_samples_per_bucket.append(len_bucket + rem)
-        return buckets, num_samples_per_bucket
-
-    def __iter__(self):
-        """
-        Iterates over batches of data samples.
-        """
+    def __iter__(self) -> Iterator[list[int]]:
         g = torch.Generator()
         g.manual_seed(self.epoch)
 
-        indices = []
-        if self.shuffle:
-            for bucket in self.buckets:
-                indices.append(torch.randperm(len(bucket), generator=g).tolist())
-        else:
-            for bucket in self.buckets:
-                indices.append(list(range(len(bucket))))
-
         batches = []
-        for i in range(len(self.buckets)):
-            bucket = self.buckets[i]
-            len_bucket = len(bucket)
-            ids_bucket = indices[i]
-            num_samples_bucket = self.num_samples_per_bucket[i]
-
-            rem = num_samples_bucket - len_bucket
-            ids_bucket = (
-                ids_bucket
-                + ids_bucket * (rem // len_bucket)
-                + ids_bucket[: (rem % len_bucket)]
-            )
-
-            ids_bucket = ids_bucket[self.rank :: self.num_replicas]
-
-            # batching
-            for j in range(len(ids_bucket) // self.batch_size):
-                batch = [
-                    bucket[idx]
-                    for idx in ids_bucket[
-                        j * self.batch_size : (j + 1) * self.batch_size
-                    ]
-                ]
-                batches.append(batch)
+        for bucket, num_samples in zip(self.buckets, self.num_samples_per_bucket, strict=True):
+            ids = torch.randperm(len(bucket), generator=g).tolist() if self.shuffle else list(range(len(bucket)))
+            rem = num_samples - len(bucket)
+            ids = ids + ids * (rem // len(bucket)) + ids[: rem % len(bucket)]
+            for j in range(len(ids) // self.batch_size):
+                batches.append([bucket[i] for i in ids[j * self.batch_size : (j + 1) * self.batch_size]])
 
         if self.shuffle:
-            batch_ids = torch.randperm(len(batches), generator=g).tolist()
-            batches = [batches[i] for i in batch_ids]
-        self.batches = batches
+            batches = [batches[i] for i in torch.randperm(len(batches), generator=g).tolist()]
+        return iter(batches)
 
-        assert len(self.batches) * self.batch_size == self.num_samples
-        return iter(self.batches)
-
-    def _bisect(self, x, lo=0, hi=None):
-        """
-        Performs binary search to find the bucket index for a given length.
-
-        Args:
-            x (int): Length to find the bucket for.
-            lo (int, optional): Lower bound of the search range. Defaults to 0.
-            hi (int, optional): Upper bound of the search range. Defaults to None.
-        """
-        if hi is None:
-            hi = len(self.boundaries) - 1
-
-        if hi > lo:
-            mid = (hi + lo) // 2
-            if self.boundaries[mid] < x and x <= self.boundaries[mid + 1]:
-                return mid
-            elif x <= self.boundaries[mid]:
-                return self._bisect(x, lo, mid)
-            else:
-                return self._bisect(x, mid + 1, hi)
-        else:
-            return -1
-
-    def __len__(self):
-        """
-        Returns the length of the sampler.
-        """
+    def __len__(self) -> int:
         return self.num_samples // self.batch_size
