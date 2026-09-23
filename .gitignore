@@ -172,3 +172,6 @@ cython_debug/
 !/rvc/models/**/
 !/rvc/models/**/.gitkeep
 /logs/
+
+# The RVC engine keeps source code in rvc/lib, which the Python template above ignores as build output.
+!/rvc/lib/
