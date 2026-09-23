@@ -44,9 +44,7 @@ class ResidualBlock(nn.Module):
             kernel_size=3,
             padding=1,
         )
-        self.bn1 = nn.BatchNorm2d(
-            in_channels,
-        )
+        self.norm1 = nn.InstanceNorm2d(in_channels)
         self.relu = nn.ReLU(
             inplace=True,
         )
@@ -56,17 +54,15 @@ class ResidualBlock(nn.Module):
             kernel_size=3,
             padding=1,
         )
-        self.bn2 = nn.BatchNorm2d(
-            in_channels,
-        )
+        self.norm2 = nn.InstanceNorm2d(in_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.norm1(out)
         out = self.relu(out)
         out = self.conv2(out)
-        out = self.bn2(out)
+        out = self.norm2(out)
         out += residual
         return out
 
