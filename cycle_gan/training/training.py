@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import torch
 from torch import device as torch_device
 from torch import nn
@@ -5,6 +7,24 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 from .models import Discriminator, Generator, VoiceDataset
+
+
+def discriminator_loss(
+    discriminator: nn.Module,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Least-squares GAN loss that pushes real predictions to 1 and fake predictions to 0.
+
+    The generated batch is detached before it reaches the discriminator, so gradients
+    flow into the discriminator for both terms but never back into the generator.
+    """
+    pred_real = discriminator(real)
+    pred_fake = discriminator(fake.detach())
+    loss_real = criterion(pred_real, torch.ones_like(pred_real))
+    loss_fake = criterion(pred_fake, torch.zeros_like(pred_fake))
+    return (loss_real + loss_fake) * 0.5
 
 
 def train_cycle_gan(
@@ -76,26 +96,11 @@ def train_cycle_gan(
 
             # Train the discriminators
             optimizer_disc_A.zero_grad()
-            pred_real_A = disc_A(real_A)
-            loss_disc_A_real = criterion_adv(
-                pred_real_A,
-                torch.ones_like(pred_real_A),
-            )
-            loss_disc_A_fake = criterion_adv(pred_fake_A.detach(), torch.zeros_like(pred_fake_A))
-            loss_disc_A = (loss_disc_A_real + loss_disc_A_fake) * 0.5
+            loss_disc_A = discriminator_loss(disc_A, real_A, fake_A, criterion_adv)
             loss_disc_A.backward()
             optimizer_disc_A.step()
 
             optimizer_disc_B.zero_grad()
-            pred_real_B = disc_B(real_B)
-            loss_disc_B_real = criterion_adv(
-                pred_real_B,
-                torch.ones_like(pred_real_B),
-            )
-            loss_disc_B_fake = criterion_adv(
-                pred_fake_B.detach(),
-                torch.zeros_like(pred_fake_B),
-            )
-            loss_disc_B = (loss_disc_B_real + loss_disc_B_fake) * 0.5
+            loss_disc_B = discriminator_loss(disc_B, real_B, fake_B, criterion_adv)
             loss_disc_B.backward()
             optimizer_disc_B.step()
