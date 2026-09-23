@@ -1,7 +1,7 @@
 [project]
-name = "python-project-template"
+name = "voice-swapper"
 version = "0.1.0"
-description = "Add your description here"
+description = "CycleGAN voice conversion between two speakers using mel spectrograms"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
