@@ -1,10 +1,13 @@
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from cycle_gan.training.models import Discriminator, Generator
-from cycle_gan.training.training import discriminator_loss, paired_batches
+from cycle_gan.training.training import discriminator_loss, paired_batches, train_cycle_gan
 
 
 def test_discriminator_loss_trains_the_discriminator_on_fakes() -> None:
@@ -57,3 +60,28 @@ def test_paired_batches_covers_every_batch_of_the_longer_loader() -> None:
 def test_paired_batches_rejects_an_empty_loader() -> None:
     with pytest.raises(ValueError):
         paired_batches(DataLoader(TensorDataset(torch.arange(0))), DataLoader(TensorDataset(torch.arange(1))))
+
+
+def test_training_saves_a_loadable_checkpoint_each_epoch(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    for speaker in ("a", "b"):
+        (tmp_path / speaker).mkdir()
+        np.save(tmp_path / speaker / "clip.npy", np.random.uniform(-1, 1, (32, 64)).astype(np.float32))
+    checkpoint_dir = tmp_path / "checkpoints"
+
+    models = train_cycle_gan(
+        str(tmp_path / "a"),
+        str(tmp_path / "b"),
+        num_epochs=2,
+        device=torch.device("cpu"),
+        checkpoint_dir=checkpoint_dir,
+        segment_frames=32,
+    )
+
+    assert sorted(p.name for p in checkpoint_dir.iterdir()) == ["epoch_001.pt", "epoch_002.pt"]
+    checkpoint = torch.load(checkpoint_dir / "epoch_002.pt")
+    assert checkpoint["epoch"] == 2
+    restored = Generator()
+    restored.load_state_dict(checkpoint["gen_A2B"])
+    for saved, trained in zip(restored.state_dict().values(), models.gen_A2B.state_dict().values()):
+        assert torch.equal(saved, trained)
