@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.3",
     "soundfile>=0.14.0",
+    "speechbrain>=1.1.1",
     "torch>=2.14.0",
     "torchaudio>=2.11.0",
     "tqdm>=4.70.1",
@@ -41,3 +42,13 @@ venvPath = "."
 venv = ".venv"
 # Resolve imports like cycle_gan.config from the project root.
 extraPaths = ["."]
+
+# Only torch and torchaudio come from the PyTorch index. Everything else uses PyPI.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+torchaudio = [{ index = "pytorch-cu130" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
