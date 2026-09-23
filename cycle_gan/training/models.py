@@ -7,18 +7,31 @@ from torch.utils.data import Dataset
 
 
 class VoiceDataset(Dataset):
-    def __init__(self, mel_spectrogram_path: str):
+    """Fixed-length segments cut from every .npy mel spectrogram in a folder.
+
+    Each file is split into non-overlapping segments of segment_frames frames.
+    A leftover tail shorter than one segment is dropped, as are whole files that
+    are shorter than one segment.
+    """
+
+    def __init__(self, mel_spectrogram_path: str, segment_frames: int = 128):
         self.mel_spectrogram_path = Path(mel_spectrogram_path)
+        self.segment_frames = segment_frames
         self.files: list[Path] = sorted(self.mel_spectrogram_path.glob("*.npy"))
+        self.segments: list[tuple[Path, int]] = []
+        for file in self.files:
+            num_frames = np.load(file, mmap_mode="r").shape[-1]
+            for start in range(0, num_frames - segment_frames + 1, segment_frames):
+                self.segments.append((file, start))
 
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.segments)
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        """Return a (1, n_mels, frames) tensor so batches are (batch, 1, n_mels, frames)."""
-        mel_spectrogram_file = self.files[index]
-        mel_spectrogram = np.load(mel_spectrogram_file)
-        mel_spectrogram_tensor = torch.from_numpy(mel_spectrogram).float()
+        """Return a (1, n_mels, segment_frames) tensor so batches are (batch, 1, n_mels, segment_frames)."""
+        file, start = self.segments[index]
+        mel_spectrogram = np.load(file, mmap_mode="r")[:, start : start + self.segment_frames]
+        mel_spectrogram_tensor = torch.from_numpy(np.array(mel_spectrogram, dtype=np.float32))
         return mel_spectrogram_tensor.unsqueeze(0)
 
 
