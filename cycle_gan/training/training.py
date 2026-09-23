@@ -1,4 +1,5 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from itertools import islice
 
 import torch
 from torch import device as torch_device
@@ -7,6 +8,24 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 from .models import Discriminator, Generator, VoiceDataset
+
+
+def _repeat(loader: DataLoader) -> Iterator:
+    """Iterate over a loader forever, starting a fresh (reshuffled) pass each time it runs out."""
+    while True:
+        yield from loader
+
+
+def paired_batches(loader_a: DataLoader, loader_b: DataLoader) -> Iterator[tuple]:
+    """Pair batches from two loaders for as many steps as the longer one has.
+
+    The shorter loader restarts when it runs out, so no data from the larger
+    speaker is skipped in an epoch.
+    """
+    if len(loader_a) == 0 or len(loader_b) == 0:
+        raise ValueError("Both data loaders need at least one batch.")
+    steps = max(len(loader_a), len(loader_b))
+    return zip(islice(_repeat(loader_a), steps), islice(_repeat(loader_b), steps))
 
 
 def discriminator_loss(
@@ -62,7 +81,7 @@ def train_cycle_gan(
     criterion_adv = nn.MSELoss()
 
     for epoch in range(num_epochs):
-        for data_A, data_B in zip(data_loader_A, data_loader_B):
+        for data_A, data_B in paired_batches(data_loader_A, data_loader_B):
             real_A = data_A.to(device)
             real_B = data_B.to(device)
 

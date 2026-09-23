@@ -1,8 +1,10 @@
+import pytest
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from cycle_gan.training.models import Discriminator, Generator
-from cycle_gan.training.training import discriminator_loss
+from cycle_gan.training.training import discriminator_loss, paired_batches
 
 
 def test_discriminator_loss_trains_the_discriminator_on_fakes() -> None:
@@ -40,3 +42,18 @@ def test_discriminator_loss_fake_term_has_gradient() -> None:
     first_layer = next(discriminator.parameters())
     assert first_layer.grad is not None
     assert first_layer.grad.abs().sum() > 0
+
+
+def test_paired_batches_covers_every_batch_of_the_longer_loader() -> None:
+    loader_a = DataLoader(TensorDataset(torch.arange(5)), batch_size=1)
+    loader_b = DataLoader(TensorDataset(torch.arange(2)), batch_size=1)
+
+    pairs = [(int(a[0]), int(b[0])) for a, b in paired_batches(loader_a, loader_b)]
+
+    assert [a for a, _ in pairs] == [0, 1, 2, 3, 4]
+    assert [b for _, b in pairs] == [0, 1, 0, 1, 0]
+
+
+def test_paired_batches_rejects_an_empty_loader() -> None:
+    with pytest.raises(ValueError):
+        paired_batches(DataLoader(TensorDataset(torch.arange(0))), DataLoader(TensorDataset(torch.arange(1))))
