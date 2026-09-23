@@ -1,23 +1,21 @@
-import torch
-import torch.nn as nn
-import numpy as np
-from torch.utils.data import Dataset
 from pathlib import Path
-from typing import List
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset
 
 
 class VoiceDataset(Dataset):
     def __init__(self, mel_spectrogram_path: str):
         self.mel_spectrogram_path = Path(mel_spectrogram_path)
-        self.files: List[Path] = sorted(
-            list(self.mel_spectrogram_path.glob("*.npy")),
-        )
+        self.files: list[Path] = sorted(self.mel_spectrogram_path.glob("*.npy"))
 
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        mel_spectrogram_file = self.files[idx]
+    def __getitem__(self, index: int) -> torch.Tensor:
+        mel_spectrogram_file = self.files[index]
         mel_spectrogram = np.load(mel_spectrogram_file)
         mel_spectrogram_tensor = torch.from_numpy(mel_spectrogram)
         return mel_spectrogram_tensor
@@ -25,7 +23,7 @@ class VoiceDataset(Dataset):
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels: int):
-        super(ResidualBlock, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(
             in_channels,
             in_channels,
@@ -66,7 +64,7 @@ class Generator(nn.Module):
         out_channels: int = 1,
         num_res_blocks: int = 6,
     ):
-        super(Generator, self).__init__()
+        super().__init__()
 
         self.encoder = nn.Sequential(
             nn.Conv2d(
@@ -102,7 +100,7 @@ class Generator(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self, in_channels: int = 1):
-        super(Discriminator, self).__init__()
+        super().__init__()
 
         self.layers = nn.Sequential(
             nn.Conv2d(

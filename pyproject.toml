@@ -1,0 +1,36 @@
+[project]
+name = "python-project-template"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "soundfile>=0.14.0",
+    "torch>=2.14.0",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.1",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit-hooks>=6.0.0",
+    "prek>=0.3.10",
+    "pytest>=9.0.3",
+    "ruff>=0.15.11",
+    "ty>=0.0.32",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = []

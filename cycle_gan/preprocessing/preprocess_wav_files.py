@@ -1,15 +1,15 @@
 import sys
+from pathlib import Path
+
 import numpy as np
 import torchaudio
 from torchaudio.transforms import MelSpectrogram
-from pathlib import Path
-from typing import Union
 from tqdm import tqdm
 
 
 def preprocess_wav_files(
-    input_dir: Union[str, Path],
-    output_dir: Union[str, Path],
+    input_dir: str | Path,
+    output_dir: str | Path,
     n_fft: int = 2048,
     n_mels: int = 128,
     hop_length: int = 256,
@@ -38,9 +38,7 @@ def preprocess_wav_files(
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(
-            "Usage: python preprocess_wav_files.py <input_directory> <output_directory>"  # noqa: E501
-        )
+        print("Usage: python preprocess_wav_files.py <input_directory> <output_directory>")
         sys.exit(1)
 
     input_directory = sys.argv[1]

@@ -1,0 +1,67 @@
+fail_fast: true
+
+repos:
+  - repo: local
+    hooks:
+      - id: trailing-whitespace
+        name: trailing-whitespace
+        entry: uv run trailing-whitespace-fixer
+        language: system
+        files: \.(py|ipynb|yaml|yml|md)$
+
+      - id: end-of-file-fixer
+        name: end-of-file-fixer
+        entry: uv run end-of-file-fixer
+        language: system
+        files: \.(py|ipynb|yaml|yml|md)$
+
+      - id: check-yaml
+        name: check-yaml
+        entry: uv run check-yaml
+        language: system
+        files: \.(yaml|yml)$
+
+      - id: check-added-large-files
+        name: check-added-large-files
+        entry: uv run check-added-large-files
+        language: system
+
+      - id: check-merge-conflict
+        name: check-merge-conflict
+        entry: uv run check-merge-conflict
+        language: system
+
+      - id: debug-statements
+        name: debug-statements
+        entry: uv run debug-statement-hook
+        language: system
+        files: \.py$
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        files: \.(py|ipynb)$
+        pass_filenames: false
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        files: \.(py|ipynb)$
+        pass_filenames: false
+
+      - id: ty
+        name: ty
+        entry: uv run ty check
+        language: system
+        files: \.py$
+        pass_filenames: false
+
+      # - id: pytest
+      #   name: pytest
+      #   entry: uv run pytest
+      #   language: system
+      #   pass_filenames: false

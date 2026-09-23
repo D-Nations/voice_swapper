@@ -1,8 +1,7 @@
 # https://github.com/github/gitignore/blob/main/Python.gitignore
 
 # Project-specific files
-data/audio/
-data/numpy/
+/data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
