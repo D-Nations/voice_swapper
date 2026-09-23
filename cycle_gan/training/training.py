@@ -10,7 +10,17 @@ from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
+from cycle_gan.config import CONFIG
 from cycle_gan.training.models import Discriminator, Generator, VoiceDataset
+
+NUM_EPOCHS = 100
+BATCH_SIZE = 1
+LEARNING_RATE = 0.0002
+ADAM_BETAS = (0.5, 0.999)
+
+# Loss weights relative to the adversarial loss.
+LAMBDA_CYCLE = 10.0
+LAMBDA_IDENTITY = 5.0
 
 
 def _repeat(loader: DataLoader) -> Iterator:
@@ -62,10 +72,11 @@ def train_cycle_gan(
     num_epochs: int,
     device: torch_device,
     checkpoint_dir: str | Path,
-    lambda_cycle: float = 10.0,
-    lambda_identity: float = 5.0,
-    batch_size: int = 1,
-    segment_frames: int = 128,
+    lambda_cycle: float = LAMBDA_CYCLE,
+    lambda_identity: float = LAMBDA_IDENTITY,
+    batch_size: int = BATCH_SIZE,
+    segment_frames: int = CONFIG.data.segment_frames,
+    learning_rate: float = LEARNING_RATE,
 ) -> CycleGAN:
     """Train a CycleGAN between two speakers and save a checkpoint after every epoch.
 
@@ -90,11 +101,11 @@ def train_cycle_gan(
     # Initialize the optimizers
     optimizer_gen = Adam(
         list(gen_A2B.parameters()) + list(gen_B2A.parameters()),
-        lr=0.0002,
-        betas=(0.5, 0.999),
+        lr=learning_rate,
+        betas=ADAM_BETAS,
     )
-    optimizer_disc_A = Adam(disc_A.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    optimizer_disc_B = Adam(disc_B.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    optimizer_disc_A = Adam(disc_A.parameters(), lr=learning_rate, betas=ADAM_BETAS)
+    optimizer_disc_B = Adam(disc_B.parameters(), lr=learning_rate, betas=ADAM_BETAS)
 
     # Initialize the loss functions
     criterion_cycle = nn.L1Loss()
@@ -180,9 +191,10 @@ if __name__ == "__main__":
     parser.add_argument("voice_data_A", help="Folder of preprocessed .npy spectrograms for speaker A")
     parser.add_argument("voice_data_B", help="Folder of preprocessed .npy spectrograms for speaker B")
     parser.add_argument("checkpoint_dir", help="Folder to write epoch checkpoints to")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--segment-frames", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--segment-frames", type=int, default=CONFIG.data.segment_frames)
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -194,4 +206,5 @@ if __name__ == "__main__":
         checkpoint_dir=args.checkpoint_dir,
         batch_size=args.batch_size,
         segment_frames=args.segment_frames,
+        learning_rate=args.learning_rate,
     )

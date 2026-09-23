@@ -1,0 +1,17 @@
+# Settings shared by more than one module.
+# Settings used by only one module are constants at the top of that module.
+
+[audio]
+# Used by preprocessing to build spectrograms and by the vocoder to turn them back into audio.
+# Changing any of these means the spectrograms must be regenerated.
+sample_rate = 22050 # Hz. Every file is resampled to this rate.
+n_fft = 2048
+win_length = 1024
+hop_length = 256 # Samples between frames, so about 86 frames per second.
+n_mels = 128
+min_db = -80.0 # Power below this is treated as silence and maps to -1.
+max_db = 50.0 # Power above this is clipped and maps to 1.
+
+[data]
+# Used by the dataset and the training script.
+segment_frames = 128 # Frames per training sample, about 1.5 seconds.

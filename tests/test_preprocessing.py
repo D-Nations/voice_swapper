@@ -3,9 +3,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from cycle_gan.config import CONFIG
 from cycle_gan.preprocessing.preprocess_wav_files import (
-    MAX_DB,
-    MIN_DB,
     load_audio,
     normalized_db_to_power,
     power_to_normalized_db,
@@ -64,7 +63,8 @@ def test_saved_spectrograms_are_scaled_to_the_tanh_range(wav_dir: Path, tmp_path
 
 
 def test_normalization_maps_the_db_range_endpoints_to_minus_one_and_one() -> None:
-    power = torch.tensor([0.0, 10 ** (MIN_DB / 10), 10 ** (MAX_DB / 10), 1e12])
+    min_db, max_db = CONFIG.audio.min_db, CONFIG.audio.max_db
+    power = torch.tensor([0.0, 10 ** (min_db / 10), 10 ** (max_db / 10), 1e12])
 
     normalized = power_to_normalized_db(power)
 

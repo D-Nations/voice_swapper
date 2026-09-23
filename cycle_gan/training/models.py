@@ -1,9 +1,23 @@
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
+
+from cycle_gan.config import CONFIG
+
+# Generator architecture.
+GENERATOR_CHANNELS = 64
+NUM_RES_BLOCKS = 6
+GENERATOR_KERNEL_SIZE = 7  # Kernel size of the first and last convolutions.
+RES_BLOCK_KERNEL_SIZE = 3
+
+# Discriminator architecture. Each entry is a stride-2 convolution that halves the input size.
+DISCRIMINATOR_CHANNELS = (64, 128, 256, 512)
+DISCRIMINATOR_KERNEL_SIZE = 4
+LEAKY_RELU_SLOPE = 0.2
 
 
 class VoiceDataset(Dataset):
@@ -14,7 +28,7 @@ class VoiceDataset(Dataset):
     are shorter than one segment.
     """
 
-    def __init__(self, mel_spectrogram_path: str, segment_frames: int = 128):
+    def __init__(self, mel_spectrogram_path: str, segment_frames: int = CONFIG.data.segment_frames):
         self.mel_spectrogram_path = Path(mel_spectrogram_path)
         self.segment_frames = segment_frames
         self.files: list[Path] = sorted(self.mel_spectrogram_path.glob("*.npy"))
@@ -36,24 +50,12 @@ class VoiceDataset(Dataset):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int, kernel_size: int = RES_BLOCK_KERNEL_SIZE):
         super().__init__()
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            in_channels,
-            kernel_size=3,
-            padding=1,
-        )
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size // 2)
         self.norm1 = nn.InstanceNorm2d(in_channels)
-        self.relu = nn.ReLU(
-            inplace=True,
-        )
-        self.conv2 = nn.Conv2d(
-            in_channels,
-            in_channels,
-            kernel_size=3,
-            padding=1,
-        )
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size // 2)
         self.norm2 = nn.InstanceNorm2d(in_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -72,32 +74,24 @@ class Generator(nn.Module):
         self,
         in_channels: int = 1,
         out_channels: int = 1,
-        num_res_blocks: int = 6,
+        num_res_blocks: int = NUM_RES_BLOCKS,
+        channels: int = GENERATOR_CHANNELS,
+        kernel_size: int = GENERATOR_KERNEL_SIZE,
     ):
         super().__init__()
 
         self.encoder = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                64,
-                kernel_size=7,
-                padding=3,
-            ),
-            nn.InstanceNorm2d(64),
+            nn.Conv2d(in_channels, channels, kernel_size=kernel_size, padding=kernel_size // 2),
+            nn.InstanceNorm2d(channels),
             nn.ReLU(inplace=True),
         )
 
         self.middle = nn.Sequential(
-            *[ResidualBlock(64) for _ in range(num_res_blocks)],
+            *[ResidualBlock(channels) for _ in range(num_res_blocks)],
         )
 
         self.decoder = nn.Sequential(
-            nn.Conv2d(
-                64,
-                out_channels,
-                kernel_size=7,
-                padding=3,
-            ),
+            nn.Conv2d(channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2),
             nn.Tanh(),
         )
 
@@ -109,58 +103,28 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, in_channels: int = 1):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        channels: tuple[int, ...] = DISCRIMINATOR_CHANNELS,
+        kernel_size: int = DISCRIMINATOR_KERNEL_SIZE,
+        leaky_relu_slope: float = LEAKY_RELU_SLOPE,
+    ):
         super().__init__()
 
-        self.layers = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                64,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.LeakyReLU(
-                0.2,
-                inplace=True,
-            ),
-            nn.Conv2d(
-                64,
-                128,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.InstanceNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(
-                128,
-                256,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.InstanceNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(
-                256,
-                512,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.InstanceNorm2d(512),
-            nn.LeakyReLU(
-                0.2,
-                inplace=True,
-            ),
-            nn.Conv2d(
-                512,
-                1,
-                kernel_size=4,
-                padding=1,
-            ),
-        )
+        # The first block has no normalization, as in the standard PatchGAN discriminator.
+        layers: list[nn.Module] = [
+            nn.Conv2d(in_channels, channels[0], kernel_size=kernel_size, stride=2, padding=1),
+            nn.LeakyReLU(leaky_relu_slope, inplace=True),
+        ]
+        for previous, current in pairwise(channels):
+            layers += [
+                nn.Conv2d(previous, current, kernel_size=kernel_size, stride=2, padding=1),
+                nn.InstanceNorm2d(current),
+                nn.LeakyReLU(leaky_relu_slope, inplace=True),
+            ]
+        layers.append(nn.Conv2d(channels[-1], 1, kernel_size=kernel_size, padding=1))
+        self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.layers(x)

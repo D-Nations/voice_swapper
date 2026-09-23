@@ -8,22 +8,30 @@ from torchaudio.functional import resample
 from torchaudio.transforms import MelSpectrogram
 from tqdm import tqdm
 
-# Fixed decibel range mapped onto the generator's Tanh output range of [-1, 1].
-# Power below MIN_DB is treated as silence and power above MAX_DB is clipped.
-MIN_DB = -80.0
-MAX_DB = 50.0
+from cycle_gan.config import CONFIG
+
+# Avoids log10(0) for fully silent bins.
+POWER_FLOOR = 1e-10
 
 
-def power_to_normalized_db(power: torch.Tensor) -> torch.Tensor:
-    """Convert a power mel spectrogram to decibels scaled into [-1, 1]."""
-    db = 10 * torch.log10(power.clamp(min=1e-10))
-    db = db.clamp(MIN_DB, MAX_DB)
-    return 2 * (db - MIN_DB) / (MAX_DB - MIN_DB) - 1
+def power_to_normalized_db(
+    power: torch.Tensor,
+    min_db: float = CONFIG.audio.min_db,
+    max_db: float = CONFIG.audio.max_db,
+) -> torch.Tensor:
+    """Convert a power mel spectrogram to decibels scaled from [min_db, max_db] into [-1, 1]."""
+    db = 10 * torch.log10(power.clamp(min=POWER_FLOOR))
+    db = db.clamp(min_db, max_db)
+    return 2 * (db - min_db) / (max_db - min_db) - 1
 
 
-def normalized_db_to_power(normalized: torch.Tensor) -> torch.Tensor:
-    """Invert power_to_normalized_db, up to the clipping at MIN_DB and MAX_DB."""
-    db = (normalized.clamp(-1, 1) + 1) / 2 * (MAX_DB - MIN_DB) + MIN_DB
+def normalized_db_to_power(
+    normalized: torch.Tensor,
+    min_db: float = CONFIG.audio.min_db,
+    max_db: float = CONFIG.audio.max_db,
+) -> torch.Tensor:
+    """Invert power_to_normalized_db, up to the clipping at min_db and max_db."""
+    db = (normalized.clamp(-1, 1) + 1) / 2 * (max_db - min_db) + min_db
     return torch.pow(10.0, db / 10)
 
 
@@ -37,11 +45,11 @@ def load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
 def preprocess_wav_files(
     input_dir: str | Path,
     output_dir: str | Path,
-    n_fft: int = 2048,
-    n_mels: int = 128,
-    hop_length: int = 256,
-    win_length: int = 1024,
-    sample_rate: int = 22050,
+    n_fft: int = CONFIG.audio.n_fft,
+    n_mels: int = CONFIG.audio.n_mels,
+    hop_length: int = CONFIG.audio.hop_length,
+    win_length: int = CONFIG.audio.win_length,
+    sample_rate: int = CONFIG.audio.sample_rate,
 ) -> None:
     mel_transform = MelSpectrogram(
         sample_rate,
