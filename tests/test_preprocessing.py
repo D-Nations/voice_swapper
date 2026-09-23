@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,9 @@ from cycle_gan.preprocessing.preprocess_wav_files import (
     power_to_normalized_db,
     preprocess_wav_files,
 )
+
+# Writes a test WAV file. Matches the make_wav fixture in conftest.py.
+WavWriter = Callable[..., Path]
 
 
 def test_load_audio_returns_channels_first_tensor(wav_dir: Path) -> None:
@@ -28,7 +32,7 @@ def test_preprocess_writes_one_spectrogram_per_wav(wav_dir: Path, tmp_path: Path
     assert spectrogram.shape[0] == 128
 
 
-def test_stereo_audio_is_downmixed_to_a_2d_spectrogram(make_wav, tmp_path: Path) -> None:
+def test_stereo_audio_is_downmixed_to_a_2d_spectrogram(make_wav: WavWriter, tmp_path: Path) -> None:
     wav = make_wav(channels=2)
     output_dir = tmp_path / "numpy"
 
@@ -39,7 +43,7 @@ def test_stereo_audio_is_downmixed_to_a_2d_spectrogram(make_wav, tmp_path: Path)
     assert spectrogram.shape[0] == 128
 
 
-def test_audio_is_resampled_to_the_target_rate(make_wav, tmp_path: Path) -> None:
+def test_audio_is_resampled_to_the_target_rate(make_wav: WavWriter, tmp_path: Path) -> None:
     wav = make_wav(sample_rate=48000, seconds=1.0)
     output_dir = tmp_path / "numpy"
 

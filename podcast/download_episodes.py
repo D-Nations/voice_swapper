@@ -24,6 +24,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
+from operator import attrgetter
 from pathlib import Path
 
 from tqdm import tqdm
@@ -131,7 +132,7 @@ def parse_feed(xml_bytes: bytes) -> list[Episode]:
         published = item.findtext("pubDate")
         date = parsedate_to_datetime(published).date().isoformat() if published else ""
         episodes.append(Episode(title=clean_title(title.strip()), audio_url=str(enclosure.get("url")), published=date))
-    return sorted(episodes, key=lambda episode: episode.published)
+    return sorted(episodes, key=attrgetter("published"))
 
 
 def fetch(url: str) -> bytes:

@@ -1,11 +1,13 @@
+import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import NotRequired, TypedDict
 
 import matplotlib
 import numpy as np
 import soundfile as sf
 import torch
+from torch.optim.optimizer import StateDict
 from torch.utils.tensorboard import SummaryWriter
 
 matplotlib.use("Agg")
@@ -18,41 +20,49 @@ PARAMETRIZED_NAMES = (".parametrizations.weight.original0", ".parametrizations.w
 LEGACY_NAMES = (".weight_g", ".weight_v")
 
 
-def replace_keys_in_dict(d: Mapping[Any, Any], old_key_part: str, new_key_part: str) -> dict[Any, Any]:
-    """Replace old_key_part with new_key_part in every string key, recursing into nested dicts."""
-    return {
-        (key.replace(old_key_part, new_key_part) if isinstance(key, str) else key): (
-            replace_keys_in_dict(value, old_key_part, new_key_part) if isinstance(value, dict) else value
-        )
-        for key, value in d.items()
-    }
+class Checkpoint(TypedDict):
+    """A G_*.pth or D_*.pth training checkpoint, with weights under their legacy names."""
+
+    model: dict[str, torch.Tensor]
+    iteration: int  # The epoch it was saved at.
+    optimizer: StateDict
+    learning_rate: float
+    scaler: NotRequired[StateDict]
 
 
-def to_legacy_names(d: Mapping[Any, Any]) -> dict[Any, Any]:
-    for new, old in zip(PARAMETRIZED_NAMES, LEGACY_NAMES, strict=True):
-        d = replace_keys_in_dict(d, new, old)
-    return dict(d)
+def _rename_keys(
+    state: Mapping[str, torch.Tensor], old_parts: tuple[str, ...], new_parts: tuple[str, ...]
+) -> dict[str, torch.Tensor]:
+    renamed = dict(state)
+    for old, new in zip(old_parts, new_parts, strict=True):
+        renamed = {key.replace(old, new): value for key, value in renamed.items()}
+    return renamed
 
 
-def from_legacy_names(d: Mapping[Any, Any]) -> dict[Any, Any]:
-    for new, old in zip(PARAMETRIZED_NAMES, LEGACY_NAMES, strict=True):
-        d = replace_keys_in_dict(d, old, new)
-    return dict(d)
+def to_legacy_names(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rename weight norm parameters from the parametrizations API to the legacy names."""
+    return _rename_keys(state, PARAMETRIZED_NAMES, LEGACY_NAMES)
+
+
+def from_legacy_names(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rename weight norm parameters from the legacy names to the parametrizations API."""
+    return _rename_keys(state, LEGACY_NAMES, PARAMETRIZED_NAMES)
 
 
 def load_checkpoint(
     checkpoint_path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer | None = None
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, StateDict]:
     """Load a training checkpoint into model and, if given, optimizer.
 
     Returns the epoch the checkpoint was saved at and the gradient scaler's state.
     """
-    checkpoint = from_legacy_names(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+    checkpoint: Checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    saved = from_legacy_names(checkpoint["model"])
     # Keep the model's own values for any keys the checkpoint lacks.
-    state = {key: checkpoint["model"].get(key, value) for key, value in model.state_dict().items()}
+    state = {key: saved.get(key, value) for key, value in model.state_dict().items()}
     model.load_state_dict(state, strict=False)
     if optimizer is not None:
-        optimizer.load_state_dict(checkpoint.get("optimizer", {}))
+        optimizer.load_state_dict(checkpoint["optimizer"])
     print(f"Loaded checkpoint '{checkpoint_path}' (epoch {checkpoint['iteration']})")
     return checkpoint["iteration"], checkpoint.get("scaler", {})
 
@@ -65,20 +75,20 @@ def save_checkpoint(
     checkpoint_path: Path,
     scaler: torch.amp.GradScaler,
 ) -> None:
-    checkpoint = {
-        "model": model.state_dict(),
+    checkpoint: Checkpoint = {
+        "model": to_legacy_names(model.state_dict()),
         "iteration": epoch,
         "optimizer": optimizer.state_dict(),
         "learning_rate": learning_rate,
         "scaler": scaler.state_dict(),
     }
-    torch.save(to_legacy_names(checkpoint), checkpoint_path)
+    torch.save(checkpoint, checkpoint_path)
     print(f"Saved checkpoint '{checkpoint_path}' (epoch {epoch})")
 
 
 def latest_checkpoint_path(directory: Path, pattern: str) -> Path | None:
     """The most recently written file in directory matching pattern, such as "G_*.pth"."""
-    checkpoints = sorted(directory.glob(pattern), key=lambda path: path.stat().st_mtime)
+    checkpoints = sorted(directory.glob(pattern), key=os.path.getmtime)
     return checkpoints[-1] if checkpoints else None
 
 

@@ -36,7 +36,7 @@ class WindowEmbeddings:
 class SpeakerEmbedder:
     """Wraps the pretrained SpeechBrain ECAPA-TDNN speaker model. Downloads it on first use."""
 
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None) -> None:
         from speechbrain.inference.speaker import EncoderClassifier
         from speechbrain.utils.fetching import LocalStrategy
 

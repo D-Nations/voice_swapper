@@ -16,6 +16,14 @@ def make_run(tmp_path: Path) -> TrainingRun:
     return TrainingRun(name="dave", dataset_dir=dataset, logs_dir=tmp_path / "logs")
 
 
+def no_missing_weights(sample_rate: int) -> list[str]:
+    return []
+
+
+def missing_rmvpe(sample_rate: int) -> list[str]:
+    return ["predictors/rmvpe.pt"]
+
+
 def option(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
@@ -37,26 +45,28 @@ def test_stage_commands_run_in_order_with_the_run_settings(tmp_path: Path) -> No
     assert option(index, "--experiment-dir") == str(run.experiment_dir)
 
 
-def test_train_voice_refuses_to_start_without_pretrained_weights(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(train, "missing_files", lambda sample_rate: ["predictors/rmvpe.pt"])
+def test_train_voice_refuses_to_start_without_pretrained_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(train, "missing_files", missing_rmvpe)
 
     with pytest.raises(FileNotFoundError, match="rmvpe"):
         train_voice(make_run(tmp_path))
 
 
-def test_train_voice_refuses_an_empty_dataset(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(train, "missing_files", lambda sample_rate: [])
+def test_train_voice_refuses_an_empty_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(train, "missing_files", no_missing_weights)
     run = TrainingRun(name="dave", dataset_dir=tmp_path, logs_dir=tmp_path / "logs")
 
     with pytest.raises(FileNotFoundError, match="No WAV clips"):
         train_voice(run)
 
 
-def test_train_voice_stops_at_the_first_failed_stage(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(train, "missing_files", lambda sample_rate: [])
-    calls = []
+def test_train_voice_stops_at_the_first_failed_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(train, "missing_files", no_missing_weights)
+    calls: list[str] = []
 
-    def fake_run(command, env, check):
+    def fake_run(command: list[str], env: dict[str, str], check: bool) -> subprocess.CompletedProcess[str]:
         calls.append(command[2])
         assert env["PYTHONPATH"].split(os.pathsep)[0] == str(REPO_ROOT)
         return subprocess.CompletedProcess(command, returncode=1 if len(calls) == 2 else 0)
@@ -68,14 +78,15 @@ def test_train_voice_stops_at_the_first_failed_stage(tmp_path: Path, monkeypatch
     assert calls == ["rvc.train.preprocess.preprocess", "rvc.train.extract.extract"]
 
 
-def test_train_voice_can_run_selected_stages(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(train, "missing_files", lambda sample_rate: [])
-    calls = []
-    monkeypatch.setattr(
-        train.subprocess,
-        "run",
-        lambda command, env, check: calls.append(command[2]) or subprocess.CompletedProcess(command, 0),
-    )
+def test_train_voice_can_run_selected_stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(train, "missing_files", no_missing_weights)
+    calls: list[str] = []
+
+    def fake_run(command: list[str], env: dict[str, str], check: bool) -> subprocess.CompletedProcess[str]:
+        calls.append(command[2])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(train.subprocess, "run", fake_run)
 
     train_voice(make_run(tmp_path), stages=["index"])
 

@@ -2,20 +2,29 @@
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, Unpack
 
 FILENAME = "model_info.json"
 
 
-def read_model_info(experiment_dir: Path) -> dict[str, Any]:
+class ModelInfo(TypedDict, total=False):
+    total_dataset_duration: str  # Such as "0:30:05", written by preprocessing.
+    total_seconds: float
+    embedder_model: str  # Written by extraction.
+    speakers_id: int  # Number of speakers, written with the file list.
+
+
+def read_model_info(experiment_dir: Path) -> ModelInfo:
     path = experiment_dir / FILENAME
     if not path.is_file():
         return {}
     with open(path, encoding="utf-8") as file:
-        return json.load(file)
+        info: ModelInfo = json.load(file)
+    return info
 
 
-def update_model_info(experiment_dir: Path, **values: Any) -> None:
-    data = read_model_info(experiment_dir) | values
+def update_model_info(experiment_dir: Path, **values: Unpack[ModelInfo]) -> None:
+    info = read_model_info(experiment_dir)
+    info.update(values)
     with open(experiment_dir / FILENAME, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
+        json.dump(info, file, indent=4)

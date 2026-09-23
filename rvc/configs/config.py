@@ -1,20 +1,68 @@
 """Typed access to the model and training settings in the <sample rate>.json files."""
 
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import Self, TypedDict
 
 from rvc.runtime import CONFIGS_DIR
 
-if TYPE_CHECKING:
-    from _typeshed import DataclassInstance
+
+class TrainSection(TypedDict):
+    """The "train" section of a config file."""
+
+    log_interval: int
+    seed: int
+    learning_rate: float
+    betas: list[float]
+    eps: float
+    lr_decay: float
+    segment_size: int
+    c_mel: float
+    c_kl: float
 
 
-def _from_dict[T: DataclassInstance](cls: type[T], values: dict[str, Any]) -> T:
-    """Build a dataclass from a dict, ignoring keys it doesn't define."""
-    names = {field.name for field in fields(cls)}
-    return cls(**{key: value for key, value in values.items() if key in names})
+class DataSection(TypedDict):
+    """The "data" section of a config file."""
+
+    max_wav_value: float
+    sample_rate: int
+    filter_length: int
+    hop_length: int
+    win_length: int
+    n_mel_channels: int
+    mel_fmin: float
+    mel_fmax: float | None
+
+
+class ModelSection(TypedDict):
+    """The "model" section of a config file."""
+
+    inter_channels: int
+    hidden_channels: int
+    filter_channels: int
+    text_enc_hidden_dim: int
+    n_heads: int
+    n_layers: int
+    kernel_size: int
+    p_dropout: float
+    resblock: str
+    resblock_kernel_sizes: list[int]
+    resblock_dilation_sizes: list[list[int]]
+    upsample_rates: list[int]
+    upsample_initial_channel: int
+    upsample_kernel_sizes: list[int]
+    use_spectral_norm: bool
+    gin_channels: int
+    spk_embed_dim: int
+
+
+class ConfigFile(TypedDict):
+    """A <sample rate>.json config file. Applio's trainer may add other top-level keys, which are ignored."""
+
+    train: TrainSection
+    data: DataSection
+    model: ModelSection
 
 
 @dataclass(frozen=True)
@@ -74,18 +122,30 @@ class RVCConfig:
     model: ModelConfig
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any]) -> Self:
-        train = dict(values["train"], betas=tuple(values["train"]["betas"]))
+    def from_dict(cls, values: ConfigFile) -> Self:
+        train = values["train"]
+        beta1, beta2 = train["betas"]
         return cls(
-            train=_from_dict(TrainConfig, train),
-            data=_from_dict(DataConfig, values["data"]),
-            model=_from_dict(ModelConfig, values["model"]),
+            train=TrainConfig(
+                log_interval=train["log_interval"],
+                seed=train["seed"],
+                learning_rate=train["learning_rate"],
+                betas=(beta1, beta2),
+                eps=train["eps"],
+                lr_decay=train["lr_decay"],
+                segment_size=train["segment_size"],
+                c_mel=train["c_mel"],
+                c_kl=train["c_kl"],
+            ),
+            data=DataConfig(**values["data"]),
+            model=ModelConfig(**values["model"]),
         )
 
     @classmethod
     def load(cls, path: str | Path) -> Self:
         with open(path, encoding="utf-8") as file:
-            return cls.from_dict(json.load(file))
+            values: ConfigFile = json.load(file)
+        return cls.from_dict(values)
 
     @classmethod
     def for_sample_rate(cls, sample_rate: int) -> Self:

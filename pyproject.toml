@@ -39,6 +39,8 @@ line-length = 120
 extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
+# Require types on every parameter and return value, tests included.
+extend-select = ["ANN"]
 ignore = []
 
 [tool.pytest.ini_options]

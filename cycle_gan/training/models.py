@@ -28,7 +28,7 @@ class VoiceDataset(Dataset):
     are shorter than one segment.
     """
 
-    def __init__(self, mel_spectrogram_path: str, segment_frames: int = CONFIG.data.segment_frames):
+    def __init__(self, mel_spectrogram_path: str, segment_frames: int = CONFIG.data.segment_frames) -> None:
         self.mel_spectrogram_path = Path(mel_spectrogram_path)
         self.segment_frames = segment_frames
         self.files: list[Path] = sorted(self.mel_spectrogram_path.glob("*.npy"))
@@ -50,7 +50,7 @@ class VoiceDataset(Dataset):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, kernel_size: int = RES_BLOCK_KERNEL_SIZE):
+    def __init__(self, in_channels: int, kernel_size: int = RES_BLOCK_KERNEL_SIZE) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size // 2)
         self.norm1 = nn.InstanceNorm2d(in_channels)
@@ -77,7 +77,7 @@ class Generator(nn.Module):
         num_res_blocks: int = NUM_RES_BLOCKS,
         channels: int = GENERATOR_CHANNELS,
         kernel_size: int = GENERATOR_KERNEL_SIZE,
-    ):
+    ) -> None:
         super().__init__()
 
         self.encoder = nn.Sequential(
@@ -109,7 +109,7 @@ class Discriminator(nn.Module):
         channels: tuple[int, ...] = DISCRIMINATOR_CHANNELS,
         kernel_size: int = DISCRIMINATOR_KERNEL_SIZE,
         leaky_relu_slope: float = LEAKY_RELU_SLOPE,
-    ):
+    ) -> None:
         super().__init__()
 
         # The first block has no normalization, as in the standard PatchGAN discriminator.

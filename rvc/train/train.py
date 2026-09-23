@@ -70,6 +70,12 @@ class TrainingOptions:
         return self.experiment_dir.name
 
 
+def empty_rolling_averages() -> dict[str, deque[float | torch.Tensor]]:
+    """The last LOG_EVERY_STEPS values of each logged quantity."""
+    names = ("grad_d", "grad_g", "disc_loss", "adv_loss", "fm_loss", "kl_loss", "mel_loss", "gen_loss")
+    return {name: deque(maxlen=LOG_EVERY_STEPS) for name in names}
+
+
 @dataclass
 class TrainingState:
     """What carries over between epochs."""
@@ -78,12 +84,7 @@ class TrainingState:
     lowest_loss: float = float("inf")
     lowest_loss_epoch: int = 0
     lowest_loss_step: int = 0
-    rolling: dict[str, deque[float | torch.Tensor]] = field(
-        default_factory=lambda: {
-            name: deque(maxlen=LOG_EVERY_STEPS)
-            for name in ("grad_d", "grad_g", "disc_loss", "adv_loss", "fm_loss", "kl_loss", "mel_loss", "gen_loss")
-        }
-    )
+    rolling: dict[str, deque[float | torch.Tensor]] = field(default_factory=empty_rolling_averages)
 
 
 class StepResult(NamedTuple):

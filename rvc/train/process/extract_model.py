@@ -2,7 +2,7 @@ import datetime
 import hashlib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 import torch
 
@@ -13,6 +13,29 @@ from rvc.train.utils import to_legacy_names
 
 VERSION = "v2"
 VOCODER = "HiFi-GAN"
+
+# One of Synthesizer's positional arguments, as saved in a voice model's "config" list.
+type ConfigEntry = int | float | str | list[int] | list[list[int]]
+
+
+class VoiceModel(TypedDict):
+    """An exported voice model file, in the format Applio and other RVC tools read."""
+
+    weight: dict[str, torch.Tensor]  # fp16 generator weights, without the posterior encoder.
+    config: list[ConfigEntry]
+    epoch: int
+    step: int
+    sr: int
+    f0: bool
+    version: str
+    creation_date: str
+    model_hash: str
+    dataset_length: str | None
+    model_name: str
+    author: str | None
+    embedder_model: str
+    speakers_id: int
+    vocoder: str
 
 
 def export_voice_model(
@@ -31,7 +54,7 @@ def export_voice_model(
     model_path.parent.mkdir(parents=True, exist_ok=True)
     info = read_model_info(model_path.parent)
     data, model = config.data, config.model
-    model_config = [
+    model_config: list[ConfigEntry] = [
         data.spec_channels,
         32,
         model.inter_channels,
@@ -52,8 +75,9 @@ def export_voice_model(
         data.sample_rate,
     ]
     hash_input = f"{name}-{epoch}-{step}-{data.sample_rate}-{VERSION}-{model_config}"
-    exported: dict[str, Any] = {
-        "weight": {key: value.half() for key, value in generator_state.items() if "enc_q" not in key},
+    weights = {key: value.half() for key, value in generator_state.items() if "enc_q" not in key}
+    exported: VoiceModel = {
+        "weight": to_legacy_names(weights),
         "config": model_config,
         "epoch": epoch,
         "step": step,
@@ -69,5 +93,5 @@ def export_voice_model(
         "speakers_id": info.get("speakers_id", 1),
         "vocoder": VOCODER,
     }
-    torch.save(to_legacy_names(exported), model_path)
+    torch.save(exported, model_path)
     print(f"Saved voice model '{model_path}' (epoch {epoch}, step {step})")
