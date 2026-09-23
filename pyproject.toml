@@ -34,3 +34,10 @@ ignore = []
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = []
+
+[tool.pyright]
+# Point Pylance and Pyright at the uv-managed virtual environment.
+venvPath = "."
+venv = ".venv"
+# Resolve imports like cycle_gan.config from the project root.
+extraPaths = ["."]
