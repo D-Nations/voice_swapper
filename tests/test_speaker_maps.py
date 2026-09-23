@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,8 @@ from diarization.speaker_maps import (
     label_windows,
     map_file,
     robust_voiceprint,
+    sample_segments,
+    write_segment_index,
 )
 
 WINDOWS_PER_CELL = round(WINDOW_SECONDS / HOP_SECONDS)
@@ -70,7 +73,7 @@ def test_find_segments_trims_edges_and_drops_short_runs() -> None:
     segments = find_segments(speaker_map, edge_trim_seconds=0.25, min_segment_seconds=3.0)
 
     # Dave's windows 0-9 give cells 0-9 (cell 10 is shared with Tamler). Tamler's run is too short.
-    assert segments == [Segment("dave", 0.25, 10 * HOP_SECONDS - 0.25)]
+    assert segments == [Segment("dave", 0.25, 10 * HOP_SECONDS - 0.25, similarity=0.9)]
 
 
 def test_speaker_map_round_trips_through_csv(tmp_path: Path) -> None:
@@ -109,3 +112,33 @@ def test_extract_segments_writes_wavs_per_speaker(tmp_path: Path) -> None:
     assert len(dave_files) == len(tamler_files) == 1
     assert sf.info(dave_files[0]).duration == pytest.approx(3.0)
     assert sf.info(tamler_files[0]).duration == pytest.approx(4.0)
+
+
+def test_write_segment_index_lists_every_segment(tmp_path: Path) -> None:
+    segments = {
+        Path("ep1.mp3"): [Segment("dave", 1.0, 5.5, 0.71)],
+        Path("ep2.mp3"): [Segment("tamler", 2.0, 6.0, 0.64)],
+    }
+
+    write_segment_index(tmp_path / "segments.csv", segments)
+
+    with open(tmp_path / "segments.csv", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert [(r["audio_file"], r["speaker"], r["duration"], r["similarity"]) for r in rows] == [
+        ("ep1.mp3", "dave", "4.50", "0.71"),
+        ("ep2.mp3", "tamler", "4.00", "0.64"),
+    ]
+
+
+def test_sample_segments_takes_up_to_n_per_speaker_reproducibly() -> None:
+    segments = {
+        Path("ep1.mp3"): [Segment("dave", float(i), float(i) + 4) for i in range(10)],
+        Path("ep2.mp3"): [Segment("tamler", 0.0, 4.0)],
+    }
+
+    sampled = sample_segments(segments, per_speaker=3, seed=1)
+
+    speakers = [s.speaker for file_segments in sampled.values() for s in file_segments]
+    assert speakers.count("dave") == 3
+    assert speakers.count("tamler") == 1
+    assert sampled == sample_segments(segments, per_speaker=3, seed=1)

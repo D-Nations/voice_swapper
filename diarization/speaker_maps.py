@@ -5,7 +5,9 @@ Workflow, run as `python -m diarization.speaker_maps <command>`:
 1. enroll   Build a voiceprint for each speaker from folders of clips that mostly contain them.
 2. map      Score every window of every audio file in a folder against the voiceprints and save
             one CSV map per file.
-3. extract  Turn maps into confident single-speaker segments and write them out as WAV files.
+3. index    List every confident single-speaker segment in one CSV, with its match score.
+4. extract  Write confident segments out as WAV files. --sample N writes only N random
+            segments per speaker, for checking the results by ear.
 
 The enrollment clips do not need to be perfect. Voiceprints are built from the windows that
 agree with each other most, so a minority of wrong windows barely affects them.
@@ -137,6 +139,7 @@ class Segment:
     speaker: str
     start: float  # seconds
     end: float  # seconds
+    similarity: float = 0.0  # Mean similarity to the speaker's voiceprint over the segment's windows
 
     @property
     def duration(self) -> float:
@@ -204,15 +207,65 @@ def find_segments(
         if j < len(cells) and cells[j] == cells[run_start]:
             continue
         if cells[run_start] >= 0:
+            speaker_index = int(cells[run_start])
+            # Windows lying entirely inside the run, or every window touching it if none do.
+            inside = speaker_map.similarities[run_start : j - windows_per_cell + 1, speaker_index]
+            if len(inside) == 0:
+                inside = speaker_map.similarities[run_start:j, speaker_index]
             segment = Segment(
-                speaker=speaker_map.speakers[cells[run_start]],
+                speaker=speaker_map.speakers[speaker_index],
                 start=run_start * HOP_SECONDS + edge_trim_seconds,
                 end=j * HOP_SECONDS - edge_trim_seconds,
+                similarity=round(float(inside.mean()), 4),
             )
             if segment.duration >= min_segment_seconds:
                 segments.append(segment)
         run_start = j
     return segments
+
+
+def segments_by_file(
+    audio_dir: Path,
+    maps_dir: Path,
+    min_similarity: float = MIN_SIMILARITY,
+    min_margin: float = MIN_MARGIN,
+) -> dict[Path, list[Segment]]:
+    """Find the confident segments of every audio file in audio_dir that has a map."""
+    result = {}
+    for file in audio_files(audio_dir):
+        map_path = maps_dir / f"{file.stem}.csv"
+        if map_path.exists():
+            result[file] = find_segments(SpeakerMap.load(map_path), min_similarity, min_margin)
+    return result
+
+
+def write_segment_index(path: str | Path, segments: dict[Path, list[Segment]]) -> None:
+    """Write every segment as one CSV row, so later steps can choose clips without re-reading maps."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["audio_file", "speaker", "start", "end", "duration", "similarity"])
+        for audio_file, file_segments in segments.items():
+            for s in file_segments:
+                writer.writerow(
+                    [audio_file.name, s.speaker, f"{s.start:.2f}", f"{s.end:.2f}", f"{s.duration:.2f}", s.similarity]
+                )
+
+
+def sample_segments(segments: dict[Path, list[Segment]], per_speaker: int, seed: int = 0) -> dict[Path, list[Segment]]:
+    """Pick up to per_speaker random segments for each speaker, keeping them grouped by file."""
+    rng = np.random.default_rng(seed)
+    by_speaker: dict[str, list[tuple[Path, Segment]]] = {}
+    for file, file_segments in segments.items():
+        for segment in file_segments:
+            by_speaker.setdefault(segment.speaker, []).append((file, segment))
+    sampled: dict[Path, list[Segment]] = {}
+    for pairs in by_speaker.values():
+        for index in rng.choice(len(pairs), size=min(per_speaker, len(pairs)), replace=False):
+            file, segment = pairs[index]
+            sampled.setdefault(file, []).append(segment)
+    return sampled
 
 
 def extract_segments(audio_path: str | Path, segments: list[Segment], output_dir: str | Path) -> None:
@@ -260,12 +313,21 @@ def main(argv: list[str] | None = None) -> None:
     map_parser.add_argument("--maps", type=Path, required=True, help="Folder for the CSV maps")
     map_parser.add_argument("--overwrite", action="store_true", help="Redo files that already have a map")
 
+    index_parser = commands.add_parser("index", help="Write one CSV listing every confident segment in every map")
+    index_parser.add_argument("audio_dir", type=Path)
+    index_parser.add_argument("--maps", type=Path, required=True)
+    index_parser.add_argument("--output", type=Path, required=True, help="Output CSV file")
+    index_parser.add_argument("--min-similarity", type=float, default=MIN_SIMILARITY)
+    index_parser.add_argument("--min-margin", type=float, default=MIN_MARGIN)
+
     extract_parser = commands.add_parser("extract", help="Write confident single-speaker segments as WAV files")
     extract_parser.add_argument("audio_dir", type=Path)
     extract_parser.add_argument("--maps", type=Path, required=True)
     extract_parser.add_argument("--output", type=Path, required=True, help="Folder for per-speaker WAV files")
     extract_parser.add_argument("--min-similarity", type=float, default=MIN_SIMILARITY)
     extract_parser.add_argument("--min-margin", type=float, default=MIN_MARGIN)
+    extract_parser.add_argument("--sample", type=int, help="Extract only this many random segments per speaker")
+    extract_parser.add_argument("--seed", type=int, default=0, help="Random seed for --sample")
 
     args = parser.parse_args(argv)
 
@@ -282,18 +344,27 @@ def main(argv: list[str] | None = None) -> None:
         for file in tqdm(todo, desc="Mapping", unit="file"):
             map_file(file, voiceprints, embedder).save(args.maps / f"{file.stem}.csv")
 
+    elif args.command == "index":
+        segments = segments_by_file(args.audio_dir, args.maps, args.min_similarity, args.min_margin)
+        write_segment_index(args.output, segments)
+        _print_totals(segments, "indexed")
+
     elif args.command == "extract":
-        totals: dict[str, float] = {}
-        for file in tqdm(audio_files(args.audio_dir), desc="Extracting", unit="file"):
-            map_path = args.maps / f"{file.stem}.csv"
-            if not map_path.exists():
-                continue
-            segments = find_segments(SpeakerMap.load(map_path), args.min_similarity, args.min_margin)
-            extract_segments(file, segments, args.output)
-            for segment in segments:
-                totals[segment.speaker] = totals.get(segment.speaker, 0.0) + segment.duration
-        for speaker, seconds in sorted(totals.items()):
-            print(f"{speaker}: {seconds / 3600:.2f} hours extracted")
+        segments = segments_by_file(args.audio_dir, args.maps, args.min_similarity, args.min_margin)
+        if args.sample is not None:
+            segments = sample_segments(segments, args.sample, args.seed)
+        for file, file_segments in tqdm(segments.items(), desc="Extracting", unit="file"):
+            extract_segments(file, file_segments, args.output)
+        _print_totals(segments, "extracted")
+
+
+def _print_totals(segments: dict[Path, list[Segment]], verb: str) -> None:
+    totals: dict[str, float] = {}
+    for file_segments in segments.values():
+        for segment in file_segments:
+            totals[segment.speaker] = totals.get(segment.speaker, 0.0) + segment.duration
+    for speaker, seconds in sorted(totals.items()):
+        print(f"{speaker}: {seconds / 3600:.2f} hours {verb}")
 
 
 if __name__ == "__main__":
