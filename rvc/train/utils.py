@@ -118,7 +118,8 @@ def plot_spectrogram_to_numpy(spectrogram: np.ndarray) -> np.ndarray:
     ax.set_ylabel("Channels")
     fig.tight_layout()
     canvas = fig.canvas
-    assert isinstance(canvas, FigureCanvasAgg)
+    if not isinstance(canvas, FigureCanvasAgg):
+        raise TypeError(f"Plotting needs matplotlib's Agg backend, not {type(canvas).__name__}.")
     canvas.draw()
     data = np.asarray(canvas.buffer_rgba())[..., :3].copy()
     plt.close(fig)

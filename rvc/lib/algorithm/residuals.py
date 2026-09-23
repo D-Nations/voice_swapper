@@ -99,8 +99,8 @@ class ResidualCouplingLayer(torch.nn.Module):
         self.post = torch.nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
         # Start as the identity transform.
         self.post.weight.data.zero_()
-        assert self.post.bias is not None
-        self.post.bias.data.zero_()
+        if self.post.bias is not None:
+            self.post.bias.data.zero_()
 
     def forward(
         self, x: torch.Tensor, x_mask: torch.Tensor, g: torch.Tensor | None = None, reverse: bool = False

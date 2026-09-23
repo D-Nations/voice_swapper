@@ -6,9 +6,8 @@ from torch.nn.utils import parametrize
 
 def init_weights(module: torch.nn.Module, mean: float = 0.0, std: float = 0.01) -> None:
     """Draw the weights of convolution layers from a normal distribution. Pass to Module.apply."""
-    if "Conv" in type(module).__name__:
-        weight = module.weight
-        assert isinstance(weight, torch.Tensor)
+    weight = getattr(module, "weight", None)
+    if "Conv" in type(module).__name__ and isinstance(weight, torch.Tensor):
         weight.data.normal_(mean, std)
 
 

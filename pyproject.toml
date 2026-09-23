@@ -39,9 +39,12 @@ line-length = 120
 extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
-# Require types on every parameter and return value, tests included.
-extend-select = ["ANN"]
+# Require types on every parameter and return value, tests included (ANN). Asserts are only for tests (S101).
+extend-select = ["ANN", "S101"]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -89,7 +89,8 @@ class Encoder(nn.Module):
         skips: list[torch.Tensor] = []
         x = self.bn(x)
         for layer in self.layers:
-            assert isinstance(layer, ResEncoderBlock) and layer.pool is not None
+            if not isinstance(layer, ResEncoderBlock) or layer.pool is None:
+                raise TypeError("Every encoder layer must be a ResEncoderBlock with a pool.")
             skip = layer(x)
             skips.append(skip)
             x = layer.pool(skip)

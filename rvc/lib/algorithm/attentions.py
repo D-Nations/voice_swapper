@@ -122,7 +122,8 @@ class MultiHeadAttention(torch.nn.Module):
         return torch.matmul(rel_weights, rel_emb.unsqueeze(0))
 
     def _get_relative_embeddings(self, embeddings: torch.Tensor, length: int) -> torch.Tensor:
-        assert self.window_size is not None
+        if self.window_size is None:
+            raise ValueError("Relative position embeddings need a window_size.")
         pad_length = max(length - (self.window_size + 1), 0)
         start = max((self.window_size + 1) - length, 0)
         end = start + 2 * length - 1
