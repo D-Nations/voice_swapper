@@ -15,10 +15,11 @@ class VoiceDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, index: int) -> torch.Tensor:
+        """Return a (1, n_mels, frames) tensor so batches are (batch, 1, n_mels, frames)."""
         mel_spectrogram_file = self.files[index]
         mel_spectrogram = np.load(mel_spectrogram_file)
-        mel_spectrogram_tensor = torch.from_numpy(mel_spectrogram)
-        return mel_spectrogram_tensor
+        mel_spectrogram_tensor = torch.from_numpy(mel_spectrogram).float()
+        return mel_spectrogram_tensor.unsqueeze(0)
 
 
 class ResidualBlock(nn.Module):

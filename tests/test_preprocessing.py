@@ -19,3 +19,14 @@ def test_preprocess_writes_one_spectrogram_per_wav(wav_dir: Path, tmp_path: Path
 
     spectrogram = np.load(output_dir / "clip.npy")
     assert spectrogram.shape[0] == 128
+
+
+def test_stereo_audio_is_downmixed_to_a_2d_spectrogram(make_wav, tmp_path: Path) -> None:
+    wav = make_wav(channels=2)
+    output_dir = tmp_path / "numpy"
+
+    preprocess_wav_files(wav.parent, output_dir)
+
+    spectrogram = np.load(output_dir / "clip.npy")
+    assert spectrogram.ndim == 2
+    assert spectrogram.shape[0] == 128

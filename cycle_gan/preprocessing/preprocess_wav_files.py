@@ -39,8 +39,8 @@ def preprocess_wav_files(
     wav_files = list(input_path.glob("*.wav"))
     for wav_file in tqdm(wav_files, desc="Processing WAV files", unit="file"):
         waveform, _ = load_audio(wav_file)
-        mel_spectrogram = mel_transform(waveform)
-        mel_spectrogram = mel_spectrogram.squeeze(0).numpy()
+        mono = waveform.mean(dim=0)
+        mel_spectrogram = mel_transform(mono).numpy()
         np.save(output_path / f"{wav_file.stem}.npy", mel_spectrogram)
 
 
