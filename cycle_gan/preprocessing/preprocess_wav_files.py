@@ -8,6 +8,24 @@ from torchaudio.functional import resample
 from torchaudio.transforms import MelSpectrogram
 from tqdm import tqdm
 
+# Fixed decibel range mapped onto the generator's Tanh output range of [-1, 1].
+# Power below MIN_DB is treated as silence and power above MAX_DB is clipped.
+MIN_DB = -80.0
+MAX_DB = 50.0
+
+
+def power_to_normalized_db(power: torch.Tensor) -> torch.Tensor:
+    """Convert a power mel spectrogram to decibels scaled into [-1, 1]."""
+    db = 10 * torch.log10(power.clamp(min=1e-10))
+    db = db.clamp(MIN_DB, MAX_DB)
+    return 2 * (db - MIN_DB) / (MAX_DB - MIN_DB) - 1
+
+
+def normalized_db_to_power(normalized: torch.Tensor) -> torch.Tensor:
+    """Invert power_to_normalized_db, up to the clipping at MIN_DB and MAX_DB."""
+    db = (normalized.clamp(-1, 1) + 1) / 2 * (MAX_DB - MIN_DB) + MIN_DB
+    return torch.pow(10.0, db / 10)
+
 
 def load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
     """Load an audio file as a (channels, samples) float tensor and its sample rate."""
@@ -43,7 +61,7 @@ def preprocess_wav_files(
         mono = waveform.mean(dim=0)
         if file_sample_rate != sample_rate:
             mono = resample(mono, file_sample_rate, sample_rate)
-        mel_spectrogram = mel_transform(mono).numpy()
+        mel_spectrogram = power_to_normalized_db(mel_transform(mono)).numpy()
         np.save(output_path / f"{wav_file.stem}.npy", mel_spectrogram)
 
 

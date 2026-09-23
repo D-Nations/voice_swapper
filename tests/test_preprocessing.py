@@ -1,8 +1,16 @@
 from pathlib import Path
 
 import numpy as np
+import torch
 
-from cycle_gan.preprocessing.preprocess_wav_files import load_audio, preprocess_wav_files
+from cycle_gan.preprocessing.preprocess_wav_files import (
+    MAX_DB,
+    MIN_DB,
+    load_audio,
+    normalized_db_to_power,
+    power_to_normalized_db,
+    preprocess_wav_files,
+)
 
 
 def test_load_audio_returns_channels_first_tensor(wav_dir: Path) -> None:
@@ -41,3 +49,31 @@ def test_audio_is_resampled_to_the_target_rate(make_wav, tmp_path: Path) -> None
     # One second at 22,050 Hz with a centered STFT gives 1 + 22050 // 256 frames.
     spectrogram = np.load(output_dir / "clip.npy")
     assert spectrogram.shape[1] == 1 + 22050 // 256
+
+
+def test_saved_spectrograms_are_scaled_to_the_tanh_range(wav_dir: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "numpy"
+
+    preprocess_wav_files(wav_dir, output_dir)
+
+    spectrogram = np.load(output_dir / "clip.npy")
+    assert spectrogram.min() >= -1.0
+    assert spectrogram.max() <= 1.0
+    # A loud tone should use the upper part of the range, not collapse to silence.
+    assert spectrogram.max() > 0.0
+
+
+def test_normalization_maps_the_db_range_endpoints_to_minus_one_and_one() -> None:
+    power = torch.tensor([0.0, 10 ** (MIN_DB / 10), 10 ** (MAX_DB / 10), 1e12])
+
+    normalized = power_to_normalized_db(power)
+
+    assert torch.allclose(normalized, torch.tensor([-1.0, -1.0, 1.0, 1.0]))
+
+
+def test_normalization_round_trips_within_the_db_range() -> None:
+    power = torch.tensor([1e-6, 1e-3, 1.0, 1e3, 1e4])
+
+    restored = normalized_db_to_power(power_to_normalized_db(power))
+
+    assert torch.allclose(restored, power, rtol=1e-4)
