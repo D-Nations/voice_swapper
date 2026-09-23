@@ -17,7 +17,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -86,6 +86,15 @@ class TrainingState:
     )
 
 
+class StepResult(NamedTuple):
+    """A training step's batch, output, and losses, kept for the end-of-epoch logs."""
+
+    batch: TrainingBatch
+    ids_slice: torch.Tensor
+    y_hat: torch.Tensor
+    losses: dict[str, float | torch.Tensor]
+
+
 @dataclass
 class Trainer:
     options: TrainingOptions
@@ -142,72 +151,82 @@ class Trainer:
         return norm
 
     def train_epoch(self, epoch: int) -> None:
-        config, state = self.config, self.state
         self.sampler.set_epoch(epoch)
         self.net_g.train()
         self.net_d.train()
         started = time.time()
 
+        last: StepResult | None = None
         for batch in tqdm(self.loader, leave=False):
-            batch = batch.to(self.device, non_blocking=True)
-            with self.autocast():
-                y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
-                    batch.phone,
-                    batch.phone_lengths,
-                    batch.pitch,
-                    batch.pitchf,
-                    batch.spec,
-                    batch.spec_lengths,
-                    batch.sid,
-                )
-                # The matching slice of the real audio.
-                wave = commons.slice_segments(
-                    batch.wave, ids_slice * config.data.hop_length, config.train.segment_size, dim=3
-                )
-
-            with self.autocast():
-                y_d_hat_r, y_d_hat_g, _, _ = self.net_d(wave, y_hat.detach())
-            loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g)
-            grad_norm_d = self.backward_and_step(loss_disc, self.optim_d, self.net_d, update_scaler=False)
-
-            self.net_d.requires_grad_(False)
-            with self.autocast():
-                _, y_d_hat_g, fmap_r, fmap_g = self.net_d(wave, y_hat)
-            loss_mel = torch.nn.functional.l1_loss(self.mel(wave), self.mel(y_hat)) * config.train.c_mel
-            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
-            loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen = generator_loss(y_d_hat_g)
-            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
-
-            if loss_gen_all.item() < state.lowest_loss:
-                state.lowest_loss = loss_gen_all.item()
-                state.lowest_loss_epoch = epoch
-                state.lowest_loss_step = state.global_step
-            grad_norm_g = self.backward_and_step(loss_gen_all, self.optim_g, self.net_g, update_scaler=True)
-            self.net_d.requires_grad_(True)
-            state.global_step += 1
-
-            for name, value in (
-                ("grad_d", grad_norm_d),
-                ("grad_g", grad_norm_g),
-                ("disc_loss", loss_disc.detach()),
-                ("adv_loss", loss_gen.detach()),
-                ("fm_loss", loss_fm.detach()),
-                ("kl_loss", loss_kl.detach()),
-                ("mel_loss", loss_mel.detach()),
-                ("gen_loss", loss_gen_all.detach()),
-            ):
-                state.rolling[name].append(value)
-            if state.global_step % LOG_EVERY_STEPS == 0:
-                self.log_rolling_averages()
+            last = self.train_step(batch.to(self.device, non_blocking=True), epoch)
+        if last is None:
+            raise ValueError("The training data loader produced no batches.")
 
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+        losses = last.losses | {"learning_rate": self.optim_g.param_groups[0]["lr"]}
+        self.log_epoch(epoch, last.batch, last.ids_slice, last.y_hat, losses)
+        self.print_progress(epoch, time.time() - started)
+        if epoch % self.options.save_every_epochs == 0 or epoch >= self.options.total_epochs:
+            self.save(epoch)
 
-        losses = {
+    def train_step(self, batch: TrainingBatch, epoch: int) -> StepResult:
+        """One discriminator update and one generator update on a batch."""
+        config, state = self.config, self.state
+        with self.autocast():
+            y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
+                batch.phone,
+                batch.phone_lengths,
+                batch.pitch,
+                batch.pitchf,
+                batch.spec,
+                batch.spec_lengths,
+                batch.sid,
+            )
+            # The matching slice of the real audio.
+            wave = commons.slice_segments(
+                batch.wave, ids_slice * config.data.hop_length, config.train.segment_size, dim=3
+            )
+
+        with self.autocast():
+            y_d_hat_r, y_d_hat_g, _, _ = self.net_d(wave, y_hat.detach())
+        loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g)
+        grad_norm_d = self.backward_and_step(loss_disc, self.optim_d, self.net_d, update_scaler=False)
+
+        self.net_d.requires_grad_(False)
+        with self.autocast():
+            _, y_d_hat_g, fmap_r, fmap_g = self.net_d(wave, y_hat)
+        loss_mel = torch.nn.functional.l1_loss(self.mel(wave), self.mel(y_hat)) * config.train.c_mel
+        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
+        loss_fm = feature_loss(fmap_r, fmap_g)
+        loss_gen = generator_loss(y_d_hat_g)
+        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+
+        if loss_gen_all.item() < state.lowest_loss:
+            state.lowest_loss = loss_gen_all.item()
+            state.lowest_loss_epoch = epoch
+            state.lowest_loss_step = state.global_step
+        grad_norm_g = self.backward_and_step(loss_gen_all, self.optim_g, self.net_g, update_scaler=True)
+        self.net_d.requires_grad_(True)
+        state.global_step += 1
+
+        for name, value in (
+            ("grad_d", grad_norm_d),
+            ("grad_g", grad_norm_g),
+            ("disc_loss", loss_disc.detach()),
+            ("adv_loss", loss_gen.detach()),
+            ("fm_loss", loss_fm.detach()),
+            ("kl_loss", loss_kl.detach()),
+            ("mel_loss", loss_mel.detach()),
+            ("gen_loss", loss_gen_all.detach()),
+        ):
+            state.rolling[name].append(value)
+        if state.global_step % LOG_EVERY_STEPS == 0:
+            self.log_rolling_averages()
+
+        losses: dict[str, float | torch.Tensor] = {
             "loss/g/total": loss_gen_all,
             "loss/d/adv": loss_disc,
-            "learning_rate": self.optim_g.param_groups[0]["lr"],
             "grad/norm_d": grad_norm_d,
             "grad/norm_g": grad_norm_g,
             "loss/g/adv": loss_gen,
@@ -215,10 +234,7 @@ class Trainer:
             "loss/g/mel": loss_mel,
             "loss/g/kl": loss_kl,
         }
-        self.log_epoch(epoch, batch, ids_slice, y_hat, losses)
-        self.print_progress(epoch, time.time() - started)
-        if epoch % self.options.save_every_epochs == 0 or epoch >= self.options.total_epochs:
-            self.save(epoch)
+        return StepResult(batch, ids_slice, y_hat, losses)
 
     def log_rolling_averages(self) -> None:
         rolling = self.state.rolling

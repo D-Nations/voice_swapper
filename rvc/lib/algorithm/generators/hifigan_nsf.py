@@ -182,7 +182,10 @@ class HiFiGANNSFGenerator(torch.nn.Module):
             x = x + noise_conv(har_source)
             blocks = self.resblocks[i * self.num_kernels : (i + 1) * self.num_kernels]
             outputs = [checkpoint(block, x, use_reentrant=False) if use_checkpoints else block(x) for block in blocks]
-            x = sum(outputs[1:], outputs[0]) / self.num_kernels
+            x = outputs[0]
+            for output in outputs[1:]:
+                x = x + output
+            x = x / self.num_kernels
 
         x = F.leaky_relu(x)
         return torch.tanh(self.conv_post(x))

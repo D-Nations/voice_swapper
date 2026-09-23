@@ -34,7 +34,7 @@ def build_index(experiment_dir: Path, algorithm: IndexAlgorithm = "auto") -> Pat
         raise FileNotFoundError(f"No features found in {feature_dir}. Run the extract stage first.")
 
     print(f"Building the index for {experiment_dir.name}...")
-    features = np.concatenate([np.load(path) for path in feature_files], axis=0)
+    features: np.ndarray = np.concatenate([np.load(path) for path in feature_files], axis=0)
     np.random.shuffle(features)
 
     if features.shape[0] > MAX_POINTS or algorithm == "kmeans":
@@ -45,7 +45,7 @@ def build_index(experiment_dir: Path, algorithm: IndexAlgorithm = "auto") -> Pat
             compute_labels=False,
             init="random",
         )
-        features = kmeans.fit(features).cluster_centers_
+        features = np.asarray(kmeans.fit(features).cluster_centers_, dtype=np.float32)
 
     n_ivf = min(int(16 * np.sqrt(features.shape[0])), features.shape[0] // 39)
     index = faiss.index_factory(FEATURE_DIM, f"IVF{n_ivf},Flat")
