@@ -5,12 +5,25 @@ description = "CycleGAN voice conversion between two speakers using mel spectrog
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "faiss-cpu>=1.15.1",
+    "librosa>=1.0.0",
+    "matplotlib>=3.11.2",
+    "noisereduce>=3.0.3",
     "numpy>=2.5.3",
+    "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
     "soundfile>=0.14.0",
+    "soxr>=1.1.0",
     "speechbrain>=1.1.1",
+    "stftpitchshift>=2.0",
+    "tensorboard>=2.21.0",
     "torch>=2.14.0",
     "torchaudio>=2.11.0",
+    "torchcrepe>=0.0.24",
+    "torchfcpe>=0.0.4",
     "tqdm>=4.70.1",
+    "transformers>=5.17.0",
 ]
 
 [dependency-groups]
@@ -27,6 +40,9 @@ package = false
 
 [tool.ruff]
 line-length = 120
+# Third-party code: the Applio submodule, and the Applio files copied into rvc/ unchanged except for
+# targeted patches. Keeping them unformatted keeps them easy to compare with upstream.
+extend-exclude = ["third_party", "rvc/configs", "rvc/lib", "rvc/train"]
 
 [tool.ruff.lint]
 ignore = []
@@ -36,12 +52,16 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = []
 
+[tool.ty.src]
+exclude = ["third_party", "rvc/configs", "rvc/lib", "rvc/train"]
+
 [tool.pyright]
 # Point Pylance and Pyright at the uv-managed virtual environment.
 venvPath = "."
 venv = ".venv"
 # Resolve imports like cycle_gan.config from the project root.
 extraPaths = ["."]
+exclude = ["third_party", ".venv", "rvc/configs", "rvc/lib", "rvc/train"]
 
 # Only torch and torchaudio come from the PyTorch index. Everything else uses PyPI.
 [tool.uv.sources]

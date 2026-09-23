@@ -166,3 +166,9 @@ cython_debug/
 
 # Downloaded pretrained model weights
 /models/
+
+# RVC pretrained weights (downloaded by python -m rvc.weights) and training runs
+/rvc/models/**/*
+!/rvc/models/**/
+!/rvc/models/**/.gitkeep
+/logs/
