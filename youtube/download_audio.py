@@ -8,8 +8,10 @@ Run with: python -m youtube.download_audio URL [URL ...] [--start 1:23] [--end 1
 """
 
 import argparse
+import io
 import math
 import re
+import sys
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -112,6 +114,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     args = parser.parse_args(argv)
 
+    # Titles can hold characters the Windows console's default encoding can't print, like the full-width
+    # colons yt-dlp swaps in for ones that aren't allowed in file names.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for url in args.urls:
         print(f"Saved {download_audio(url, args.output_dir, args.start, args.end)}")
 

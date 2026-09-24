@@ -30,8 +30,9 @@ dev = [
     "ty>=0.0.32",
 ]
 download = [
+    "deno>=2.9.7",
     "types-yt-dlp>=2026.8.19.20260912",
-    "yt-dlp>=2026.8.19",
+    "yt-dlp[default]>=2026.8.19",
 ]
 
 [tool.uv]
