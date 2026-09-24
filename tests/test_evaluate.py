@@ -65,7 +65,7 @@ def test_summarize_averages_per_voice_and_epoch() -> None:
 def test_scores_round_trip_through_csv(tmp_path: Path) -> None:
     scores = [
         ClipScore("dave", 20, "a, b.wav", 0.8, 0.2, 0.1, "The cat, sat.", "the cat sat"),
-        ClipScore("dave", 40, "c.wav", 0.9, 0.1, 0.0, "", ""),
+        ClipScore("dave", 40, "c.wav", 0.9, 0.1, 0.0, "", "", index_rate=0.9),
     ]
     path = scores_path(tmp_path, "dave")
 
@@ -73,3 +73,23 @@ def test_scores_round_trip_through_csv(tmp_path: Path) -> None:
 
     assert path.name == "scores_dave.csv"
     assert read_scores(path) == scores
+
+
+def test_summarize_keeps_index_rates_apart() -> None:
+    scores = [
+        ClipScore("dave", 130, "a.wav", 0.8, 0.2, 0.1, "", "", index_rate=0.5),
+        ClipScore("dave", 130, "a.wav", 0.9, 0.1, 0.2, "", "", index_rate=1.0),
+    ]
+
+    assert [(s.index_rate, s.target_similarity) for s in summarize(scores)] == [(0.5, 0.8), (1.0, 0.9)]
+
+
+def test_scores_from_before_index_rates_read_as_the_default(tmp_path: Path) -> None:
+    path = tmp_path / "scores_dave.csv"
+    path.write_text(
+        "voice,epoch,clip,target_similarity,source_similarity,word_error_rate,reference_text,converted_text\n"
+        "dave,20,a.wav,0.8,0.2,0.1,,\n",
+        encoding="utf-8",
+    )
+
+    assert read_scores(path) == [ClipScore("dave", 20, "a.wav", 0.8, 0.2, 0.1, "", "", index_rate=0.75)]

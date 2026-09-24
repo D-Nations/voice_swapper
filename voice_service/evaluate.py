@@ -6,17 +6,19 @@ Each converted clip is scored two ways:
 - Word error rate: Whisper's transcript of the conversion against its transcript of the original,
   which catches epochs that sound like the target but garble the words.
 
-Writes one row per clip and epoch to scores_<voice>.csv and prints the mean scores per epoch.
+Writes one row per clip, epoch and index rate to scores_<voice>.csv and prints the mean scores.
 
 Run with: python -m voice_service.evaluate [--clips 20] [--step 20]
-Print the summary of earlier runs with: python -m voice_service.evaluate --report
+Compare index rates on each voice's chosen epoch with:
+    python -m voice_service.evaluate --chosen --index-rates 0.5 0.75 0.9 1 --output-dir data/rvc/evaluation/index_rate
+Print the summary of earlier runs with: python -m voice_service.evaluate --report [--output-dir DIR]
 """
 
 import argparse
 import csv
 import re
 from collections import defaultdict
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import cast
 
@@ -31,6 +33,7 @@ from diarization.speaker_maps import load_voiceprints
 from rvc.infer.infer import VoiceConverter, load_voice
 from rvc.infer.pipeline import SAMPLE_RATE, ConversionSettings, median_pitch
 from rvc.lib.audio import load_audio
+from voice_service.voices import VOICES
 
 MODELS_DIR = Path("data/rvc/models")
 TEST_DIR = Path("data/rvc/test")
@@ -57,6 +60,7 @@ class ClipScore:
     word_error_rate: float
     reference_text: str  # Transcript of the original clip.
     converted_text: str  # Transcript of the conversion.
+    index_rate: float = ConversionSettings.index_rate
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,7 @@ class EpochSummary:
     target_similarity: float
     source_similarity: float
     word_error_rate: float
+    index_rate: float = ConversionSettings.index_rate
 
 
 def normalize_words(text: str) -> list[str]:
@@ -167,11 +172,12 @@ def evaluate_voice(
     clips: list[Path],
     epochs: list[int],
     models_dir: Path = MODELS_DIR,
+    index_rates: tuple[float, ...] = (ConversionSettings.index_rate,),
 ) -> list[ClipScore]:
     experiment_dir = models_dir / voice
     models = voice_models(experiment_dir)
     index_path = experiment_dir / f"{voice}.index"
-    settings = ConversionSettings(target_pitch_hz=voice_median_pitch(experiment_dir))
+    base_settings = ConversionSettings(target_pitch_hz=voice_median_pitch(experiment_dir))
     source = SOURCE_SPEAKER[voice]
 
     originals = {clip: load_audio(clip, SAMPLE_RATE) for clip in clips}
@@ -181,30 +187,33 @@ def evaluate_voice(
     for epoch in tqdm(epochs, desc=voice):
         # Loaded without the converter's cache, which would keep every epoch in GPU memory.
         loaded = load_voice(models[epoch], index_path if index_path.exists() else None, converter.device)
-        for clip, audio in originals.items():
-            converted = converter.convert(audio, loaded, settings)
-            converted = librosa.resample(converted, orig_sr=loaded.sample_rate, target_sr=SAMPLE_RATE)
-            converted_text = scorer.transcribe(converted)
-            scores.append(
-                ClipScore(
-                    voice=voice,
-                    epoch=epoch,
-                    clip=clip.name,
-                    target_similarity=scorer.similarity(converted, voice),
-                    source_similarity=scorer.similarity(converted, source),
-                    word_error_rate=word_error_rate(references[clip], converted_text),
-                    reference_text=references[clip],
-                    converted_text=converted_text,
+        for index_rate in index_rates:
+            settings = replace(base_settings, index_rate=index_rate)
+            for clip, audio in originals.items():
+                converted = converter.convert(audio, loaded, settings)
+                converted = librosa.resample(converted, orig_sr=loaded.sample_rate, target_sr=SAMPLE_RATE)
+                converted_text = scorer.transcribe(converted)
+                scores.append(
+                    ClipScore(
+                        voice=voice,
+                        epoch=epoch,
+                        clip=clip.name,
+                        target_similarity=scorer.similarity(converted, voice),
+                        source_similarity=scorer.similarity(converted, source),
+                        word_error_rate=word_error_rate(references[clip], converted_text),
+                        reference_text=references[clip],
+                        converted_text=converted_text,
+                        index_rate=index_rate,
+                    )
                 )
-            )
     return scores
 
 
 def summarize(scores: list[ClipScore]) -> list[EpochSummary]:
-    """Mean scores per voice and epoch."""
-    groups: dict[tuple[str, int], list[ClipScore]] = defaultdict(list)
+    """Mean scores per voice, epoch and index rate."""
+    groups: dict[tuple[str, int, float], list[ClipScore]] = defaultdict(list)
     for score in scores:
-        groups[(score.voice, score.epoch)].append(score)
+        groups[(score.voice, score.epoch, score.index_rate)].append(score)
     return [
         EpochSummary(
             voice=voice,
@@ -212,8 +221,9 @@ def summarize(scores: list[ClipScore]) -> list[EpochSummary]:
             target_similarity=float(np.mean([s.target_similarity for s in group])),
             source_similarity=float(np.mean([s.source_similarity for s in group])),
             word_error_rate=float(np.mean([s.word_error_rate for s in group])),
+            index_rate=index_rate,
         )
-        for (voice, epoch), group in sorted(groups.items())
+        for (voice, epoch, index_rate), group in sorted(groups.items())
     ]
 
 
@@ -237,6 +247,8 @@ def read_scores(path: Path) -> list[ClipScore]:
                 word_error_rate=float(row["word_error_rate"]),
                 reference_text=row["reference_text"],
                 converted_text=row["converted_text"],
+                # Scores from before index rates were compared used the default.
+                index_rate=float(row.get("index_rate") or ConversionSettings.index_rate),
             )
             for row in csv.DictReader(file)
         ]
@@ -247,10 +259,11 @@ def scores_path(output_dir: Path, voice: str) -> Path:
 
 
 def print_summary(summaries: list[EpochSummary]) -> None:
-    print(f"{'voice':8} {'epoch':>5} {'target sim':>10} {'source sim':>10} {'WER':>6}")
+    print(f"{'voice':8} {'epoch':>5} {'index':>5} {'target sim':>10} {'source sim':>10} {'WER':>6}")
     for s in summaries:
         print(
-            f"{s.voice:8} {s.epoch:5d} {s.target_similarity:10.3f} {s.source_similarity:10.3f} {s.word_error_rate:6.1%}"
+            f"{s.voice:8} {s.epoch:5d} {s.index_rate:5.2f} {s.target_similarity:10.3f} {s.source_similarity:10.3f}"
+            f" {s.word_error_rate:6.1%}"
         )
 
 
@@ -259,6 +272,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--voices", nargs="+", choices=sorted(SOURCE_SPEAKER), default=sorted(SOURCE_SPEAKER))
     parser.add_argument("--clips", type=int, default=CLIPS_PER_VOICE, help="Held-out clips per voice")
     parser.add_argument("--step", type=int, default=EPOCH_STEP, help="Evaluate every this many epochs")
+    parser.add_argument("--chosen", action="store_true", help="Evaluate only each voice's chosen epoch")
+    parser.add_argument(
+        "--index-rates", type=float, nargs="+", default=[ConversionSettings.index_rate], help="Index rates to compare"
+    )
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR, help="Folder for scores_<voice>.csv")
     parser.add_argument("--report", action="store_true", help="Summarize earlier runs instead of evaluating")
     args = parser.parse_args(argv)
@@ -268,8 +285,12 @@ def main(argv: list[str] | None = None) -> None:
         scorer = Scorer(load_voiceprints(VOICEPRINTS), converter.device)
         for voice in args.voices:
             clips = sample_clips(TEST_DIR / SOURCE_SPEAKER[voice], args.clips)
-            epochs = choose_epochs(list(voice_models(MODELS_DIR / voice)), args.step)
-            write_scores(scores_path(args.output_dir, voice), evaluate_voice(voice, converter, scorer, clips, epochs))
+            if args.chosen:
+                epochs = [VOICES[voice].epoch]
+            else:
+                epochs = choose_epochs(list(voice_models(MODELS_DIR / voice)), args.step)
+            scores = evaluate_voice(voice, converter, scorer, clips, epochs, index_rates=tuple(args.index_rates))
+            write_scores(scores_path(args.output_dir, voice), scores)
 
     paths = [scores_path(args.output_dir, voice) for voice in args.voices]
     print_summary(summarize([score for path in paths if path.exists() for score in read_scores(path)]))
