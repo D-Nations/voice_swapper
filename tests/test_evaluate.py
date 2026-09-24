@@ -6,9 +6,12 @@ from voice_service.evaluate import (
     ClipScore,
     choose_epochs,
     normalize_words,
+    read_scores,
+    scores_path,
     summarize,
     voice_models,
     word_error_rate,
+    write_scores,
 )
 
 
@@ -46,9 +49,9 @@ def test_choose_epochs_keeps_every_step_and_the_last() -> None:
 
 def test_summarize_averages_per_voice_and_epoch() -> None:
     scores = [
-        ClipScore("dave", 20, "a.wav", 0.8, 0.2, 0.1),
-        ClipScore("dave", 20, "b.wav", 0.6, 0.4, 0.3),
-        ClipScore("dave", 40, "a.wav", 0.9, 0.1, 0.0),
+        ClipScore("dave", 20, "a.wav", 0.8, 0.2, 0.1, "", ""),
+        ClipScore("dave", 20, "b.wav", 0.6, 0.4, 0.3, "", ""),
+        ClipScore("dave", 40, "a.wav", 0.9, 0.1, 0.0, "", ""),
     ]
 
     summaries = summarize(scores)
@@ -57,3 +60,16 @@ def test_summarize_averages_per_voice_and_epoch() -> None:
         (20, pytest.approx(0.7), pytest.approx(0.2)),
         (40, pytest.approx(0.9), pytest.approx(0.0)),
     ]
+
+
+def test_scores_round_trip_through_csv(tmp_path: Path) -> None:
+    scores = [
+        ClipScore("dave", 20, "a, b.wav", 0.8, 0.2, 0.1, "The cat, sat.", "the cat sat"),
+        ClipScore("dave", 40, "c.wav", 0.9, 0.1, 0.0, "", ""),
+    ]
+    path = scores_path(tmp_path, "dave")
+
+    write_scores(path, scores)
+
+    assert path.name == "scores_dave.csv"
+    assert read_scores(path) == scores
