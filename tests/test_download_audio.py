@@ -10,6 +10,7 @@ from youtube.download_audio import (
     download_options,
     parse_timestamp,
     section_label,
+    subtitle_options,
     trim_to_section,
     whole_seconds,
 )
@@ -75,3 +76,12 @@ def test_trim_to_section_keeps_exactly_the_section(tmp_path: Path) -> None:
 def test_download_audio_rejects_an_end_before_the_start(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="after the start"):
         download_audio("https://www.youtube.com/watch?v=x", tmp_path, start=10.0, end=5.0)
+
+
+def test_subtitle_options_take_uploaded_or_automatic_tracks(tmp_path: Path) -> None:
+    options = subtitle_options(tmp_path, ("en",))
+
+    assert options.get("writesubtitles") is True
+    assert options.get("writeautomaticsub") is True
+    assert options.get("subtitleslangs") == ["en"]
+    assert options.get("outtmpl") == str(tmp_path / "%(title)s [%(id)s].%(ext)s")

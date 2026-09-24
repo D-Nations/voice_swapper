@@ -1,10 +1,13 @@
-"""Download the audio of YouTube videos as WAV files, optionally just a section of each.
+"""Download the audio of YouTube videos as WAV files, optionally just a section of each, and their subtitles.
 
 Files are named "<title> [<video id>].wav", or "<title> [<video id>] <start>-<end>s.wav" for a section.
 A file that is already in the output folder is not downloaded again.
+With --subtitles, each video's English subtitles are saved beside it as "<title> [<video id>].<language>.srt",
+including YouTube's automatic captions when there are no others.
 Needs ffmpeg on the PATH to extract and cut the audio.
 
-Run with: python -m youtube.download_audio URL [URL ...] [--start 1:23] [--end 1:31] [--output-dir DIR]
+Run with:
+    python -m youtube.download_audio URL [URL ...] [--start 1:23] [--end 1:31] [--subtitles] [--output-dir DIR]
 """
 
 import argparse
@@ -24,6 +27,8 @@ if TYPE_CHECKING:
     from yt_dlp import _DownloadRange, _YoutubeDLOptions
 
 OUTPUT_DIR = Path("data/audio/youtube")
+SUBTITLE_LANGUAGES = ("en", "en-orig")  # en-orig is YouTube's automatic captions for English videos.
+SUBTITLE_FORMAT = "srt/vtt/best"
 
 TIMESTAMP = re.compile(r"^(?:(?:(\d+):)?(\d+):)?(\d+(?:\.\d+)?)$")
 
@@ -106,11 +111,51 @@ def download_audio(url: str, output_dir: Path, start: float | None = None, end: 
     return path
 
 
+def subtitle_options(output_dir: Path, languages: tuple[str, ...] = SUBTITLE_LANGUAGES) -> _YoutubeDLOptions:
+    """yt-dlp options that pick a video's subtitle tracks, uploaded or automatic, in the given languages."""
+    return {
+        "outtmpl": str(output_dir / "%(title)s [%(id)s].%(ext)s"),
+        "windowsfilenames": True,
+        "noplaylist": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": list(languages),
+        "subtitlesformat": SUBTITLE_FORMAT,
+        "quiet": True,
+    }
+
+
+def download_subtitles(url: str, output_dir: Path, languages: tuple[str, ...] = SUBTITLE_LANGUAGES) -> list[Path]:
+    """Save a video's subtitles in each of the languages it has, and return their paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    with YoutubeDL(subtitle_options(output_dir, languages)) as ydl:
+        info = ydl.extract_info(url, download=False)
+        stem = Path(ydl.prepare_filename(info)).with_suffix("")
+        tracks = info.get("requested_subtitles") or {}
+        if not isinstance(tracks, dict):
+            raise TypeError(f"Expected yt-dlp's subtitle tracks as a dict, got {tracks!r}.")
+        for language, track in tracks.items():
+            if not isinstance(track, dict) or not isinstance(track.get("ext"), str):
+                raise TypeError(f"Unexpected subtitle track for {language}: {track!r}.")
+            path = stem.with_name(f"{stem.name}.{language}.{track['ext']}")
+            if not path.exists():
+                # yt-dlp includes the text itself for some tracks, and a link for the rest.
+                text = track.get("data")
+                if not isinstance(text, str):
+                    with ydl.urlopen(track["url"]) as response:
+                        text = response.read().decode("utf-8")
+                path.write_text(text, encoding="utf-8")
+            paths.append(path)
+    return paths
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("urls", nargs="+", help="YouTube video links")
     parser.add_argument("--start", type=parse_timestamp, help="Keep audio from here, as seconds, MM:SS or HH:MM:SS")
     parser.add_argument("--end", type=parse_timestamp, help="Keep audio up to here")
+    parser.add_argument("--subtitles", action="store_true", help="Also save each video's English subtitles")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     args = parser.parse_args(argv)
 
@@ -120,6 +165,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for url in args.urls:
         print(f"Saved {download_audio(url, args.output_dir, args.start, args.end)}")
+        if args.subtitles:
+            paths = download_subtitles(url, args.output_dir)
+            for path in paths:
+                print(f"Saved {path}")
+            if not paths:
+                print(f"No English subtitles for {url}")
 
 
 if __name__ == "__main__":
