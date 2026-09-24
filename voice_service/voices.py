@@ -2,6 +2,10 @@
 
 Epochs were chosen by speaker similarity across every saved epoch (python -m voice_service.evaluate)
 and a listening comparison, which found no audible difference between the top few.
+
+Index rates were chosen by sweeping 0 to 1 on the chosen epochs (--chosen --index-rates). Speaker
+similarity barely changed across the range, and 0.75 and above garbled slightly more words, so both
+voices use 0.4.
 """
 
 from dataclasses import dataclass
@@ -15,6 +19,7 @@ class VoiceChoice:
     key: str  # The training folder under MODELS_DIR, and the model's file name prefix.
     label: str  # Shown to people.
     epoch: int
+    index_rate: float = 0.4  # How far to pull the input's features toward the voice's training audio.
 
     def model_path(self, models_dir: Path = MODELS_DIR) -> Path:
         """The exported model for the chosen epoch, like pizarro_130e_12350s.pth."""

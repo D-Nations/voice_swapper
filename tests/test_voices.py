@@ -6,9 +6,9 @@ from voice_service.voices import VOICES, VoiceChoice
 
 
 def test_voices_are_keyed_by_their_training_folder() -> None:
-    assert {key: (voice.label, voice.epoch) for key, voice in VOICES.items()} == {
-        "pizarro": ("DAP-9000", 130),
-        "sommers": ("Tamlerator", 220),
+    assert {key: (voice.label, voice.epoch, voice.index_rate) for key, voice in VOICES.items()} == {
+        "pizarro": ("DAP-9000", 130, 0.4),
+        "sommers": ("Tamlerator", 220, 0.4),
     }
 
 
