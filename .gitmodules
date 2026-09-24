@@ -1,3 +1,6 @@
 [submodule "third_party/applio"]
 	path = third_party/applio
 	url = git@github.com:IAHispano/Applio.git
+[submodule "soundboard"]
+	path = soundboard
+	url = https://github.com/D-Nations/vbw-soundboard.git
