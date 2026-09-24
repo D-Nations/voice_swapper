@@ -1956,6 +1956,15 @@ wheels = [
 ]
 
 [[package]]
+name = "types-yt-dlp"
+version = "2026.8.19.20260912"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/59/d444cefc714f768e6fcfb9625905523de3034635c88fd2b6767c125abc72/types_yt_dlp-2026.8.19.20260912.tar.gz", hash = "sha256:d58c5f6aa5fb576312e99ab6b141bbdae4526949fdad95bb1faeae427c6327fe", size = 42242, upload-time = "2026-09-12T06:38:05.048Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/e2/f27e5d11e7c663863b29cc43f430f62ee14fbc534bd1586b497b14dddc84/types_yt_dlp-2026.8.19.20260912-py3-none-any.whl", hash = "sha256:42e4a19b38640adacbfaf307236edc5265fa0f1fe027540c61dc91d3fade9afe", size = 55305, upload-time = "2026-09-12T06:38:04.034Z" },
+]
+
+[[package]]
 name = "typing-extensions"
 version = "4.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2002,6 +2011,10 @@ dev = [
     { name = "ruff" },
     { name = "ty" },
 ]
+download = [
+    { name = "types-yt-dlp" },
+    { name = "yt-dlp" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2029,6 +2042,10 @@ dev = [
     { name = "ruff", specifier = ">=0.15.11" },
     { name = "ty", specifier = ">=0.0.32" },
 ]
+download = [
+    { name = "types-yt-dlp", specifier = ">=2026.8.19.20260912" },
+    { name = "yt-dlp", specifier = ">=2026.8.19" },
+]
 
 [[package]]
 name = "werkzeug"
@@ -2040,4 +2057,13 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/dd/b2/381be8cfdee792dd117872481b6e378f85c957dd7c5bca38897b08f765fd/werkzeug-3.1.8.tar.gz", hash = "sha256:9bad61a4268dac112f1c5cd4630a56ede601b6ed420300677a869083d70a4c44", size = 875852, upload-time = "2026-04-02T18:49:14.268Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/93/8c/2e650f2afeb7ee576912636c23ddb621c91ac6a98e66dc8d29c3c69446e1/werkzeug-3.1.8-py3-none-any.whl", hash = "sha256:63a77fb8892bf28ebc3178683445222aa500e48ebad5ec77b0ad80f8726b1f50", size = 226459, upload-time = "2026-04-02T18:49:12.72Z" },
+]
+
+[[package]]
+name = "yt-dlp"
+version = "2026.8.19"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/e0/832fa4ca334b766a06933a196066edc3dba37cdb6f14cd98d59bcc69a4b4/yt_dlp-2026.8.19.tar.gz", hash = "sha256:9e213e48cea35c66b378e4447903f118f6392a5fa380a2b6d7070ec86f4e0af1", size = 3052025, upload-time = "2026-08-19T23:48:59.291Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/b2/8cd1613f56eed7ceb64fbd4df3f1c01246bfb098e6f398228bafda22b80b/yt_dlp-2026.8.19-py3-none-any.whl", hash = "sha256:1d57897e94c6665a0a6f9bc54b34e584284e32c034ffab3a7df25d8f7b24eedf", size = 3185533, upload-time = "2026-08-19T23:48:56.925Z" },
 ]

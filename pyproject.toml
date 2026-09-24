@@ -29,9 +29,15 @@ dev = [
     "ruff>=0.15.11",
     "ty>=0.0.32",
 ]
+download = [
+    "types-yt-dlp>=2026.8.19.20260912",
+    "yt-dlp>=2026.8.19",
+]
 
 [tool.uv]
 package = false
+# The download tools stay installed locally, and images that don't need them leave the group out.
+default-groups = ["dev", "download"]
 
 [tool.ruff]
 line-length = 120
