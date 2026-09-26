@@ -1,7 +1,9 @@
 """The voices the service offers: which trained model each uses, and what it's called.
 
-Epochs were chosen by speaker similarity across every saved epoch (python -m voice_service.evaluate)
-and a listening comparison, which found no audible difference between the top few.
+Epochs were chosen by speaker similarity across every saved epoch (python -m voice_service.evaluate):
+130 for pizarro and 220 for sommers. Blind A/B tests on held-out sentences found every epoch from 130
+to 400 close to indistinguishable, with a slight lean toward these over 300, and 300 over 400 (400
+continued training on a 60-minute clip set). Word error rates didn't differ between any of them.
 
 Index rates were chosen by sweeping 0 to 1 on the chosen epochs (--chosen --index-rates). Speaker
 similarity barely changed across the range, and 0.75 and above garbled slightly more words, so both
@@ -39,7 +41,7 @@ class VoiceChoice:
 VOICES = {
     voice.key: voice
     for voice in (
-        VoiceChoice("pizarro", "DAP-9000", epoch=130),
-        VoiceChoice("sommers", "Tamlerator", epoch=220),
+        VoiceChoice("pizarro", "DaveBot", epoch=130),
+        VoiceChoice("sommers", "TamBot", epoch=220),
     )
 }
