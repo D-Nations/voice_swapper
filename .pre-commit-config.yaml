@@ -37,8 +37,6 @@ repos:
         language: system
         files: \.py$
 
-  - repo: local
-    hooks:
       - id: ruff-check
         name: ruff check
         entry: uv run ruff check --fix
