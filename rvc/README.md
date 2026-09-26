@@ -1,8 +1,7 @@
 # rvc
 
 The RVC training engine, adapted from [Applio](https://github.com/IAHispano/Applio) v3.6.5
-(commit `55fe0b97`) under its MIT license, which is in `LICENSE`. The same commit is checked out in
-`third_party/applio` for reference.
+(commit `55fe0b97`) under its MIT license, which is in `LICENSE`.
 
 Only what this project uses was kept: RVC v2 models with pitch guidance, the HiFi-GAN NSF
 vocoder, RMVPE pitch tracking, and ContentVec features, trained on one GPU. The code is typed and
