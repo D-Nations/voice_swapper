@@ -173,10 +173,14 @@ def evaluate_voice(
     epochs: list[int],
     models_dir: Path = MODELS_DIR,
     index_rates: tuple[float, ...] = (ConversionSettings.index_rate,),
+    folder: str | None = None,
 ) -> list[ClipScore]:
-    experiment_dir = models_dir / voice
+    """Score each epoch's conversions of the clips. folder is the training folder under models_dir,
+    when it isn't named after the voice (like pizarro_60min)."""
+    folder = folder or voice
+    experiment_dir = models_dir / folder
     models = voice_models(experiment_dir)
-    index_path = experiment_dir / f"{voice}.index"
+    index_path = experiment_dir / f"{folder}.index"
     base_settings = ConversionSettings(target_pitch_hz=voice_median_pitch(experiment_dir))
     source = SOURCE_SPEAKER[voice]
 
